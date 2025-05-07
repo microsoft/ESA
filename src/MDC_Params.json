@@ -1,0 +1,10 @@
+{
+    "CSVFileName": "Export_MDC_Recommendations.csv",
+    "QueryFile": "MDC.kql",
+    "SubscriptionIds": ["*"],
+    "_comments": {
+        "CSVFileName": "Final CSV output file for Power BI import",
+        "QueryFile": "KQL Query file. Do not change!",
+        "SubscriptionIds": "Comma-separated subscription IDs or '*' for all available subscriptions. If you specify specific subscriptions, ensure you connect to the correct tenant (if you have access to multiple tenants) during script execution. If you don't have access to some subscriptions, the script will continue with the remaining ones."
+    }
+}

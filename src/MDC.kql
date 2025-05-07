@@ -1,0 +1,143 @@
+securityresources
+        | where type == "microsoft.security/securescores/securescorecontrols"
+        | extend secureScoreName = (extract("/providers/Microsoft.Security/secureScores/([^/]*)/", 1, id))
+        | where secureScoreName == "ascScore"
+        | extend environment = (tostring(properties.environment))
+        | extend scope = (extract("(.*)/providers/Microsoft.Security/secureScores/", 1, id))
+        | where (environment == "AWS" or environment == "Azure" or environment == "AzureDevOps" or environment == "DockerHub" or environment == "GCP" or environment == "GitHub" or environment == "GitLab" or environment == "JFrog")
+        | extend controlDisplayName = (tostring(properties.displayName))
+        | extend controlName = (name)
+        | extend assessmentKeys = (extract_all("\"id\":\".*?/assessmentMetadata/([^\"]*)\"", tostring(properties.definition.properties.assessmentDefinitions)))
+        | extend notApplicableResourceCount = (toint(properties.notApplicableResourceCount))
+        | extend unhealthyResourceCount = (toint(properties.unhealthyResourceCount))
+        | extend healthyResourceCount = (toint(properties.healthyResourceCount))
+        | extend controlMaxScore = (toint(properties.score.max))
+        | extend currentScore = (todouble(properties.score.current))
+            | join kind=leftouter ( // We want to enrich the controls with this data
+        securityresources 
+        | where type == "microsoft.security/securescores" 
+        | where name == "ascScore"
+        | extend environment = (tostring(properties.environment))
+        | extend scopeMaxScore = (toint(properties.score.max))
+        | extend scopeWeight = (toint(properties.weight))
+        | parse id with scope "/providers/Microsoft.Security/secureScores" * 
+        | where (environment == "AWS" or environment == "Azure" or environment == "AzureDevOps" or environment == "DockerHub" or environment == "GCP" or environment == "GitHub" or environment == "GitLab" or environment == "JFrog")
+        | project scope, scopeWeight, scopeMaxScore, joinOn = 1
+            | join kind=leftouter (
+        securityresources 
+        | where type == "microsoft.security/securescores" 
+        | where name == "ascScore"
+        | extend environment = (tostring(properties.environment))
+        | where (environment == "AWS" or environment == "Azure" or environment == "AzureDevOps" or environment == "DockerHub" or environment == "GCP" or environment == "GitHub" or environment == "GitLab" or environment == "JFrog")
+        | extend scopeWeight = (toint(properties.weight))
+        | project scopeWeight
+        | summarize sumParentScopeWeight = todouble(sum(scopeWeight)), joinOn = 1
+            ) on joinOn
+            | project-away joinOn, joinOn1
+            | project sumParentScopeWeight, scope, scopeWeight = todouble(scopeWeight), scopeMaxScore = todouble(scopeMaxScore)
+            ) on scope
+            // Controls with maxScore 0 due to only N/A resources should not affect potential increase
+            | extend scopeWeight = iff(controlMaxScore == 0, todouble(0), scopeWeight)
+            | summarize assessmentKeys = any(assessmentKeys),
+                        controlDisplayName = any(controlDisplayName),
+                        notApplicableResourceCount = sum(notApplicableResourceCount),
+                        unhealthyResourceCount = sum(unhealthyResourceCount),
+                        healthyResourceCount = sum(healthyResourceCount),
+                        controlMaxScore = max(controlMaxScore),
+                        sumParentScopeWeight = max(sumParentScopeWeight),
+                        impactRatio = sum(iff(scopeMaxScore == 0, todouble(0), scopeWeight  / scopeMaxScore)),
+                        controlAggregatedCurrentScoreSum = sum(iff(scopeMaxScore == 0, todouble(0), scopeWeight * currentScore / scopeMaxScore)) by controlName
+            | extend controlAggregatedMaxScoreSum = impactRatio * controlMaxScore
+            | extend controlAggregatedCurrentScore = iff(controlAggregatedMaxScoreSum == 0, todouble(0), controlAggregatedCurrentScoreSum /  controlAggregatedMaxScoreSum) * controlMaxScore
+            | extend potentialScoreIncrease = iff(sumParentScopeWeight == 0, todouble(0), (controlAggregatedMaxScoreSum - controlAggregatedCurrentScoreSum) / sumParentScopeWeight) * 100
+            | project controlsAssessmentsData = pack_all(), controlMaxScore
+            | extend assessmentKeys = controlsAssessmentsData.assessmentKeys
+            | extend controlData = pack(
+                "controlDisplayName", controlsAssessmentsData.controlDisplayName, 
+                "controlName", controlsAssessmentsData.controlName, 
+                "assessmentKeys", controlsAssessmentsData.assessmentKeys,
+                "notApplicableResourceCount", controlsAssessmentsData.notApplicableResourceCount,
+                "unhealthyResourceCount", controlsAssessmentsData.unhealthyResourceCount,
+                "healthyResourceCount", controlsAssessmentsData.healthyResourceCount,
+                "totalResourceCount", toint(controlsAssessmentsData.notApplicableResourceCount) + toint(controlsAssessmentsData.unhealthyResourceCount) + toint(controlsAssessmentsData.healthyResourceCount),
+                "maxScore", controlsAssessmentsData.controlMaxScore,
+                "currentScore", controlsAssessmentsData.controlAggregatedCurrentScore,
+                "potentialScoreIncrease", controlsAssessmentsData.potentialScoreIncrease)
+            | mv-expand assessmentKeys limit 400
+            | project assessmentKey = tostring(assessmentKeys), controlData
+            | summarize controlsData = make_set(controlData) by assessmentKey
+            | join kind=inner (securityresources
+| where type == "microsoft.security/assessments"
+| extend assessmentDetails = parse_json(properties)
+| extend resourceDetails = parse_json(assessmentDetails.resourceDetails)
+| extend fullResourceType = tostring(resourceDetails.ResourceType)
+| extend resourceType = tostring(split(fullResourceType, '/')[1])
+| extend exportedTimestamp = now()  // Dynamic timestamp
+| extend recommendationId = id  // Full path including the GUID
+| extend recommendationName = tostring(split(id, '/')[array_length(split(id, '/')) - 1])  // Extracting just the GUID
+| extend azurePortalRecommendationLink = case(
+    tostring(assessmentDetails.links.azurePortal) startswith "https://", tostring(assessmentDetails.links.azurePortal),
+    strcat("https://", tostring(assessmentDetails.links.azurePortal))
+)) on $left.assessmentKey == $right.recommendationName
+| project 
+    exportedTimestamp = exportedTimestamp,
+    subscriptionId = subscriptionId,
+    resourceGroup = resourceGroup,
+    resourceType = resourceType,
+    resourceName = tostring(resourceDetails.ResourceName),
+    displayName = tostring(assessmentDetails.displayName),
+    state = tostring(assessmentDetails.status.code),
+    severity = tostring(assessmentDetails.metadata.severity),
+    remediationSteps = tostring(assessmentDetails.metadata.remediationDescription),
+    resourceId = tostring(resourceDetails.ResourceId),
+    recommendationName = recommendationName,
+    controls =  controlsData,
+    description = tostring(assessmentDetails.metadata.description),
+    recommendationDisplayName = tostring(assessmentDetails.metadata.displayName),
+    notApplicableReason = tostring(assessmentDetails.status.cause),
+    firstEvaluationDate = todatetime(assessmentDetails.status.firstEvaluationDate),
+    statusChangeDate = todatetime(assessmentDetails.status.statusChangeDate),
+    azurePortalRecommendationLink = azurePortalRecommendationLink,
+    nativeCloudAccountId = tostring(resourceDetails.NativeResourceId),
+    tactics = tostring(assessmentDetails.metadata.tactics[0]),
+    techniques = tostring(assessmentDetails.metadata.techniques[0]),
+    cloud = tostring(assessmentDetails.metadata.cloudProviders[0]),
+    owner = tostring(assessmentDetails.owner),
+    recommendationId = recommendationId,
+    eta = "",  // Blank column for eta
+    dueDate = "",  // Blank column for dueDate
+    gracePeriod = ""  // Blank column for gracePeriod
+| join kind=leftouter (
+    resourcecontainers
+    | where type == "microsoft.resources/subscriptions"
+    | project subscriptionId, subscriptionName = name
+) on subscriptionId
+| project
+    exportedTimestamp,
+    subscriptionId,
+    subscriptionName,
+    resourceGroup,
+    resourceType,
+    resourceName,
+    resourceId,
+    recommendationId,
+    recommendationName,
+    description,
+    recommendationDisplayName,
+    remediationSteps,
+    severity,
+    state,
+    notApplicableReason,
+    firstEvaluationDate,
+    statusChangeDate,
+    controls = coalesce(tostring(parse_json(controls)[0].controlDisplayName), "No Value"),
+    azurePortalRecommendationLink,
+    nativeCloudAccountId,
+    tactics,
+    techniques,
+    cloud,
+    owner,
+    eta,  // Blank eta column
+    dueDate,  // Blank dueDate column
+    gracePeriod  // Blank gracePeriod column
+| order by recommendationId desc
