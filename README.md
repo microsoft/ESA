@@ -131,6 +131,41 @@ This JSON file defines input parameters for the `ESA_MDC_DataExport.ps1` script 
 | `QueryFile`        | The file containing the KQL query. **Do not modify.**                                                                                                                                                                                                                                      |
 | `SubscriptionIds`  | To export data for all available subscriptions, keep the default value `'*'`. Otherwise, specify the subscription IDs to be exported. Example: `["09b43e75...", "4fc2c46b...", ...]`<br>If you don’t have access to some subscriptions, the script will continue with the remaining ones. |
 
+## 📦 Downloads
+
+- [ESA_MDC_DataExport.ps1](https://github.com/microsoft/ESA/blob/main/src/ESA_MDC_DataExport.ps1)
+- [MCSB.kql](https://github.com/microsoft/ESA/blob/main/src/MCSB.kql)
+- [MCSB_Params.json](https://github.com/microsoft/ESA/blob/main/src/MCSB_Params.json)
+- [MDC.kql](https://github.com/microsoft/ESA/blob/main/src/MDC.kql)
+- [MDC_Params.json](https://github.com/microsoft/ESA/blob/main/src/MDC_Params.json)
+
+### 📥 Download All Files via PowerShell
+
+To download all files listed above automatically, run the following script:
+
+```powershell
+param(    
+    [Parameter()][string]
+    $Branch = "main"
+)
+
+$baseURL = "https://raw.githubusercontent.com/microsoft/ESA/$Branch/src"
+
+$workingDirectory = (Get-Location).Path
+Write-Host "Working Directory: $workingDirectory"
+
+Invoke-WebRequest "$baseURL/files-list.txt" -OutFile "$workingDirectory\files-list.txt"
+
+Write-Host "Downloading from: $baseURL"
+Write-Host "We will get these files:"
+Get-Content "$workingDirectory\files-list.txt" | ForEach-Object { Write-Host "   $_" }
+
+# Download each file in the list
+Get-Content "$workingDirectory\files-list.txt" | ForEach-Object {
+    $fileName = $_
+    Invoke-WebRequest "$baseURL/$fileName" -OutFile "$workingDirectory\$fileName"
+}
+```
 
 # Trademarks
 
