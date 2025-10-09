@@ -41,6 +41,8 @@ To run the script, pass the path to a JSON parameter file:
 
 .\ESA_MDC_DataExport.ps1 MDC_Params.json
 .\ESA_MDC_DataExport.ps1 MCSB_Params.json
+.\ESA_MDC_DataExport.ps1 -CloudEnvironment AzureUSGovernment MDC_Params.json
+.\ESA_MDC_DataExport.ps1 -CloudEnvironment AzureUSGovernment MCSB_Params.json
 ```
 
 If you run the script without any parameters, a help message will be displayed.
