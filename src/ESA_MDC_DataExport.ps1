@@ -1,6 +1,8 @@
 # Version 1.0
 param(
-    [string]$ParameterFile
+    [string]$ParameterFile,
+    [string] [ValidateSet("AzureCloud", "AzureUSGovernment")]
+    $CloudEnvironment = "AzureCloud"
 )
 
 # Display usage instructions if no parameter file is provided
@@ -17,6 +19,8 @@ if (-not $ParameterFile) {
     Write-Host "Example usage:"
     Write-Host "  .\ESA_MDC_DataExport.ps1 MDC_Params.json" -ForegroundColor Green
     Write-Host "  .\ESA_MDC_DataExport.ps1 MCSB_Params.json" -ForegroundColor Green
+    Write-Host "  .\ESA_MDC_DataExport.ps1 -CloudEnvironment AzureUSGovernment MDC_Params.json" -ForegroundColor Green
+    Write-Host "  .\ESA_MDC_DataExport.ps1 -CloudEnvironment AzureUSGovernment MCSB_Params.json" -ForegroundColor Green
     Write-Host ""
     Write-Host "(The script needs to be executed twice to download both the MDC and MCSB recommendations)."
     Write-Host ""
@@ -112,7 +116,8 @@ if ($existingContext) {
             }
 
             # Request an Azure access token for tenant validation
-            $token = Get-AzAccessToken -ResourceUrl "https://management.azure.com" -TenantId $currentTenantId -ErrorAction Stop
+            $resourceUrl = (Get-AzContext).Environment.ResourceManagerUrl
+            $token = Get-AzAccessToken -ResourceUrl $resourceUrl -TenantId $currentTenantId -ErrorAction Stop
 
             if (-not $token) {
                 throw "Session is invalid."
@@ -129,7 +134,7 @@ if ($existingContext) {
             # Force re-authentication
             Write-Host "Please log in to Azure..." -ForegroundColor Cyan
             try {
-                $azContext = Connect-AzAccount -TenantId $currentTenantId -ErrorAction Stop
+                $azContext = Connect-AzAccount -Environment $CloudEnvironment -TenantId $currentTenantId -ErrorAction Stop
                 Write-Host "Re-authentication successful." -ForegroundColor Green
             } catch {
                 Write-Host "Authentication failed. Exiting." -ForegroundColor Red
@@ -143,7 +148,7 @@ if ($existingContext) {
 if (-not $azContext) {
     Write-Host "Please log in to Azure..." -ForegroundColor Cyan
     try {
-        $azContext = Connect-AzAccount -ErrorAction Stop
+        $azContext = Connect-AzAccount -Environment $CloudEnvironment -ErrorAction Stop
     } catch {
         Write-Host "Authentication failed. Exiting." -ForegroundColor Red
         exit 1
@@ -188,7 +193,7 @@ if (-not $azContext) {
             Write-Host "Re-authenticating to selected tenant: $tenantName ($tenantId) | Current Tenant $($existingContext.Tenant.Name) ($($existingContext.Tenant.Id))" -ForegroundColor Yellow
             try {
                 Disconnect-AzAccount -ErrorAction SilentlyContinue *>$null  # Ensure clean logout
-                $azContext = Connect-AzAccount -TenantId $tenantId -ErrorAction Stop 
+                $azContext = Connect-AzAccount -Environment $CloudEnvironment -TenantId $tenantId -ErrorAction Stop
             } catch {
                 Write-Host "Authentication to selected tenant failed. Exiting." -ForegroundColor Red
                 exit 1
