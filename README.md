@@ -47,7 +47,9 @@ If you run the script without any parameters, a help message will be displayed.
 
 To export both MDC and MCSB data, run the script twice - once with each parameter file.
 
-**Retry Logic:** The script uses *exponential backoff* retry logic to handle transient errors, retrying failed calls with delays of up to 28 seconds. Status messages are shown during retries.
+**Retry Logic:** The script retries transient Azure Resource Graph failures automatically. General transient failures use exponential backoff, and Resource Graph throttling or rate limiting is retried up to 10 times with increasing delays before a subscription is marked as failed.
+
+**Parallel Execution:** Subscriptions are processed with up to 20 workers in parallel. Each worker writes its own temporary CSV fragment and failed-subscription log, and the script merges those artifacts into the final output files after all workers finish.
 
 **Error Logging:** If any errors occur during the execution of the KQL query, they will be logged in a file with the `.failed` extension.
 
