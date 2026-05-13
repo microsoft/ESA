@@ -331,18 +331,18 @@ if ($parameters.SubscriptionIds -contains '*') {
 # ============================================================================
 # Pre-flight: classify subscriptions to avoid querying ones that can't return
 # MCSB-aligned data. Three batched ARG queries (~3s) bucket each subscription:
-#   - MCSB enabled            -> queryable, goes through the per-sub loop
-#   - MCSB not enabled        -> skip; surface remediation in summary
-#   - No security visibility  -> skip; likely missing role or no security data
-#   - No subscription access  -> skip; subscription not visible at ARM at all
+#   - MCSB enabled (ascScore present)         -> queryable, goes through the per-sub loop
+#   - MCSB not assigned                       -> Defender registered but MCSB compliance standard not assigned; skip
+#   - Defender for Cloud not enabled          -> no Microsoft.Security/* resources exist; skip
+#   - No access (pre-flight)                  -> sub not visible at ARM at all (no RBAC); skip
 # Failures are non-fatal: on any error we fall back to querying every input
 # subscription (existing behavior).
 # ============================================================================
 $AllInputSubscriptionIds  = @($SubscriptionIds)
 $totalInputSubscriptions  = $AllInputSubscriptionIds.Count
-$subsMcsbNotEnabled       = @()  # securityresources visible but no ascScore
-$subsNoSecurityVisibility = @()  # zero securityresources visible
-$subsNoSubscriptionAccess = @()  # subscription not visible at ARM at all
+$subsMcsbNotEnabled       = @()  # securityresources visible but no ascScore (MCSB compliance standard not assigned)
+$subsNoSecurityVisibility = @()  # zero securityresources visible (Defender for Cloud not enabled on the sub)
+$subsNoSubscriptionAccess = @()  # subscription not visible at ARM at all (no RBAC)
 $preflightSucceeded       = $false
 
 if ($totalInputSubscriptions -gt 0) {
@@ -374,9 +374,9 @@ if ($totalInputSubscriptions -gt 0) {
         $preflightSucceeded = $true
         Write-Host ("Pre-flight complete in {0:N1}s" -f $preflightDuration) -ForegroundColor DarkGray
         Write-Host ("  MCSB enabled, will query:        {0}" -f $subsMcsbEnabled.Count) -ForegroundColor Green
-        if ($subsMcsbNotEnabled.Count       -gt 0) { Write-Host ("  MCSB not enabled, skipped:       {0}" -f $subsMcsbNotEnabled.Count)       -ForegroundColor Yellow }
-        if ($subsNoSecurityVisibility.Count -gt 0) { Write-Host ("  No security resources visible:   {0}" -f $subsNoSecurityVisibility.Count) -ForegroundColor Yellow }
-        if ($subsNoSubscriptionAccess.Count -gt 0) { Write-Host ("  No subscription access:          {0}" -f $subsNoSubscriptionAccess.Count) -ForegroundColor Red }
+        if ($subsMcsbNotEnabled.Count       -gt 0) { Write-Host ("  MCSB not assigned, skipped:      {0}" -f $subsMcsbNotEnabled.Count)       -ForegroundColor Yellow }
+        if ($subsNoSecurityVisibility.Count -gt 0) { Write-Host ("  Defender not enabled, skipped:   {0}" -f $subsNoSecurityVisibility.Count) -ForegroundColor Yellow }
+        if ($subsNoSubscriptionAccess.Count -gt 0) { Write-Host ("  No access (pre-flight), skipped: {0}" -f $subsNoSubscriptionAccess.Count) -ForegroundColor Red }
 
         # Restrict the per-sub loop to MCSB-enabled subscriptions only.
         $SubscriptionIds = $subsMcsbEnabled
@@ -1249,20 +1249,20 @@ if ($subsNoData.Count -gt 0) {
     Write-Host ("Subscriptions with no data (DfC gap):  {0}" -f $subsNoData.Count) -ForegroundColor Yellow
 }
 if ($subsPermissionFail.Count -gt 0) {
-    Write-Host ("Subscriptions failed (permissions):    {0}" -f $subsPermissionFail.Count) -ForegroundColor Red
+    Write-Host ("Failed - access denied (per-query): {0}" -f $subsPermissionFail.Count) -ForegroundColor Red
 }
 if ($subsOtherFail.Count -gt 0) {
     Write-Host ("Subscriptions failed (other errors):   {0}" -f $subsOtherFail.Count) -ForegroundColor Red
 }
 if ($preflightSucceeded) {
     if ($subsMcsbNotEnabled.Count -gt 0) {
-        Write-Host ("Skipped - MCSB not enabled:            {0}" -f $subsMcsbNotEnabled.Count) -ForegroundColor Yellow
+        Write-Host ("Skipped - MCSB not assigned:           {0}" -f $subsMcsbNotEnabled.Count) -ForegroundColor Yellow
     }
     if ($subsNoSecurityVisibility.Count -gt 0) {
-        Write-Host ("Skipped - no security visibility:      {0}" -f $subsNoSecurityVisibility.Count) -ForegroundColor Yellow
+        Write-Host ("Skipped - Defender not enabled:        {0}" -f $subsNoSecurityVisibility.Count) -ForegroundColor Yellow
     }
     if ($subsNoSubscriptionAccess.Count -gt 0) {
-        Write-Host ("Skipped - no subscription access:      {0}" -f $subsNoSubscriptionAccess.Count) -ForegroundColor Red
+        Write-Host ("Skipped - no access (pre-flight):      {0}" -f $subsNoSubscriptionAccess.Count) -ForegroundColor Red
     }
 }
 # Secure-score visibility: surface the X-of-Y rate explicitly so a 1-of-87 case
@@ -1302,12 +1302,12 @@ try {
     }
     $reportLines += ("  Subscriptions with data:            {0}" -f $subsSuccessful.Count)
     $reportLines += ("  Subscriptions with no data:         {0}" -f $subsNoData.Count)
-    $reportLines += ("  Failed - missing permissions:       {0}" -f $subsPermissionFail.Count)
+    $reportLines += ("  Failed - access denied (per-query): {0}" -f $subsPermissionFail.Count)
     $reportLines += ("  Failed - other errors:              {0}" -f $subsOtherFail.Count)
     if ($preflightSucceeded) {
-        $reportLines += ("  Skipped - MCSB not enabled:         {0}" -f $subsMcsbNotEnabled.Count)
-        $reportLines += ("  Skipped - no security visibility:   {0}" -f $subsNoSecurityVisibility.Count)
-        $reportLines += ("  Skipped - no subscription access:   {0}" -f $subsNoSubscriptionAccess.Count)
+        $reportLines += ("  Skipped - MCSB not assigned:        {0}" -f $subsMcsbNotEnabled.Count)
+        $reportLines += ("  Skipped - Defender not enabled:     {0}" -f $subsNoSecurityVisibility.Count)
+        $reportLines += ("  Skipped - no access (pre-flight):   {0}" -f $subsNoSubscriptionAccess.Count)
     }
     if (Test-Path $FinalOutputFile) {
         $reportLines += ("  Output file:                        {0}" -f $FinalOutputFile)
@@ -1358,7 +1358,14 @@ try {
         $reportLines += ""
     }
     if ($subsPermissionFail.Count -gt 0) {
-        $reportLines += "SUBSCRIPTIONS FAILED - PERMISSIONS"
+        $reportLines += "SUBSCRIPTIONS FAILED - ACCESS DENIED (PER-QUERY)"
+        $reportLines += "  These subscriptions passed pre-flight (visible at ARM) but the per-sub"
+        $reportLines += "  Search-AzGraph call returned AuthorizationFailed / Forbidden / AccessDenied."
+        $reportLines += "  This is rare. Likely causes: RBAC removed mid-run, token refresh failure"
+        $reportLines += "  during a long run, or the subscription state changed (disabled / moved"
+        $reportLines += "  to another tenant) between pre-flight and the per-sub query."
+        $reportLines += "  Action: re-run the export. If it persists, verify the running identity"
+        $reportLines += "  still has Reader on these subs."
         foreach ($subId in $subsPermissionFail) { $reportLines += "  - $subId" }
         $reportLines += ""
     }
@@ -1368,32 +1375,38 @@ try {
         $reportLines += ""
     }
     if ($preflightSucceeded -and $subsMcsbNotEnabled.Count -gt 0) {
-        $reportLines += "SUBSCRIPTIONS SKIPPED - MCSB NOT ENABLED"
-        $reportLines += "  These subscriptions return security findings to ARG but do not have the"
-        $reportLines += "  Microsoft cloud security benchmark (ascScore) initiative assigned, so"
-        $reportLines += "  they cannot produce MCSB-aligned recommendations."
+        $reportLines += "SUBSCRIPTIONS SKIPPED - MCSB NOT ASSIGNED"
+        $reportLines += "  These subscriptions ARE registered with Defender for Cloud (a"
+        $reportLines += "  'Microsoft.Security/pricings' resource exists) but the Microsoft cloud"
+        $reportLines += "  security benchmark (MCSB) compliance standard is not assigned, so no"
+        $reportLines += "  ascScore baseline is produced and no MCSB-aligned recommendations exist."
         $reportLines += "  Action: assign the 'Microsoft cloud security benchmark' policy initiative"
-        $reportLines += "  to these subscriptions (or to a parent management group) so Defender for"
-        $reportLines += "  Cloud can produce a Secure Score baseline."
+        $reportLines += "  to these subscriptions (or to a parent management group)."
         foreach ($subId in $subsMcsbNotEnabled) { $reportLines += "  - $subId" }
         $reportLines += ""
     }
     if ($preflightSucceeded -and $subsNoSecurityVisibility.Count -gt 0) {
-        $reportLines += "SUBSCRIPTIONS SKIPPED - NO SECURITY VISIBILITY"
-        $reportLines += "  These subscriptions returned zero rows from the 'securityresources' table."
-        $reportLines += "  Action: verify that the Security Reader (or Reader) role is assigned to the"
-        $reportLines += "  running identity on these subscriptions, and that MCSB is enabled on this"
-        $reportLines += "  subscription."
+        $reportLines += "SUBSCRIPTIONS SKIPPED - DEFENDER FOR CLOUD NOT ENABLED"
+        $reportLines += "  These subscriptions returned zero rows from the 'securityresources' table,"
+        $reportLines += "  meaning Defender for Cloud is not registered on them (no"
+        $reportLines += "  'Microsoft.Security/pricings' resource and the 'Microsoft.Security'"
+        $reportLines += "  resource provider may also be unregistered)."
+        $reportLines += "  Action: enable Defender for Cloud on each subscription (Foundational CSPM"
+        $reportLines += "  is free), or assign the built-in policy 'Enable Microsoft Defender for"
+        $reportLines += "  Cloud on your subscription' at a parent management group to onboard them"
+        $reportLines += "  in bulk. See https://learn.microsoft.com/azure/defender-for-cloud/onboard-management-group"
         foreach ($subId in $subsNoSecurityVisibility) { $reportLines += "  - $subId" }
         $reportLines += ""
     }
     if ($preflightSucceeded -and $subsNoSubscriptionAccess.Count -gt 0) {
-        $reportLines += "SUBSCRIPTIONS SKIPPED - NO SUBSCRIPTION ACCESS"
+        $reportLines += "SUBSCRIPTIONS SKIPPED - NO ACCESS (PRE-FLIGHT)"
         $reportLines += "  These subscription IDs were not visible at ARM at all (Azure Resource Graph"
-        $reportLines += "  reported no 'microsoft.resources/subscriptions' container for them)."
+        $reportLines += "  reported no 'microsoft.resources/subscriptions' container for them), which"
+        $reportLines += "  means the running identity has no RBAC on the subscription."
         $reportLines += "  Action: confirm the subscription IDs are correct and that the running"
         $reportLines += "  identity has at least Reader role on each subscription (or a parent"
-        $reportLines += "  management group)."
+        $reportLines += "  management group). If a sub was deleted or moved to a different tenant,"
+        $reportLines += "  remove it from the input list."
         foreach ($subId in $subsNoSubscriptionAccess) { $reportLines += "  - $subId" }
         $reportLines += ""
     }
