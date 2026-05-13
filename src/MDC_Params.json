@@ -4,7 +4,7 @@
     "SubscriptionIds": ["*"],
     "Parallel": false,
     "RemediationUrls": [
-        { "Label": "Onboard Defender for Cloud at management group level", "Url": "https://learn.microsoft.com/en-us/azure/defender-for-cloud/enable-defender-for-cloud-management-groups" },
+        { "Label": "Onboard Defender for Cloud at management group level", "Url": "https://learn.microsoft.com/en-us/azure/defender-for-cloud/onboard-management-group" },
         { "Label": "Microsoft Cloud Security Benchmark overview",          "Url": "https://learn.microsoft.com/en-us/security/benchmark/azure/overview" }
     ],
     "_comments": {
