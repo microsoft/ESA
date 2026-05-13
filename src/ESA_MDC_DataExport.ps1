@@ -328,6 +328,63 @@ if ($parameters.SubscriptionIds -contains '*') {
     $SubscriptionIds = $parameters.SubscriptionIds
 }
 
+# ============================================================================
+# Pre-flight: classify subscriptions to avoid querying ones that can't return
+# MCSB-aligned data. Three batched ARG queries (~3s) bucket each subscription:
+#   - MCSB enabled            -> queryable, goes through the per-sub loop
+#   - MCSB not enabled        -> skip; surface remediation in summary
+#   - No security visibility  -> skip; likely missing role or no security data
+#   - No subscription access  -> skip; subscription not visible at ARM at all
+# Failures are non-fatal: on any error we fall back to querying every input
+# subscription (existing behavior).
+# ============================================================================
+$AllInputSubscriptionIds  = @($SubscriptionIds)
+$totalInputSubscriptions  = $AllInputSubscriptionIds.Count
+$subsMcsbNotEnabled       = @()  # securityresources visible but no ascScore
+$subsNoSecurityVisibility = @()  # zero securityresources visible
+$subsNoSubscriptionAccess = @()  # subscription not visible at ARM at all
+$preflightSucceeded       = $false
+
+if ($totalInputSubscriptions -gt 0) {
+    Write-Host ""
+    Write-Host ("Pre-flight: classifying {0} subscription(s)..." -f $totalInputSubscriptions) -ForegroundColor Cyan
+    $preflightStartTime = Get-Date
+    try {
+        # Probe 1: subs visible at ARM (Reader or higher)
+        $r1 = Search-AzGraph -Subscription $AllInputSubscriptionIds -Query "resourcecontainers | where type == 'microsoft.resources/subscriptions' | distinct subscriptionId" -First 1000 -ErrorAction Stop
+        $visibleArmIds = if ($r1.PSObject.Properties.Name -contains 'Data') { @(@($r1.Data).subscriptionId) } else { @(@($r1).subscriptionId) }
+
+        # Probe 2: subs with at least one securityresources entry (Security Reader)
+        $r2 = Search-AzGraph -Subscription $AllInputSubscriptionIds -Query "securityresources | distinct subscriptionId" -First 1000 -ErrorAction Stop
+        $secVisibleIds = if ($r2.PSObject.Properties.Name -contains 'Data') { @(@($r2.Data).subscriptionId) } else { @(@($r2).subscriptionId) }
+
+        # Probe 3: subs with the MCSB ascScore baseline
+        $r3 = Search-AzGraph -Subscription $AllInputSubscriptionIds -Query "securityresources | where type == 'microsoft.security/securescores' and name == 'ascScore' | distinct subscriptionId" -First 1000 -ErrorAction Stop
+        $mcsbReadyIds = if ($r3.PSObject.Properties.Name -contains 'Data') { @(@($r3.Data).subscriptionId) } else { @(@($r3).subscriptionId) }
+
+        # Bucket every input sub. Order matters: ascScore set is the strictest
+        # so we check it first; everything else falls through to the relevant
+        # 'why was this skipped' bucket.
+        $subsMcsbEnabled          = @($AllInputSubscriptionIds | Where-Object { $_ -in $mcsbReadyIds })
+        $subsMcsbNotEnabled       = @($AllInputSubscriptionIds | Where-Object { $_ -in $secVisibleIds  -and $_ -notin $mcsbReadyIds })
+        $subsNoSecurityVisibility = @($AllInputSubscriptionIds | Where-Object { $_ -in $visibleArmIds  -and $_ -notin $secVisibleIds })
+        $subsNoSubscriptionAccess = @($AllInputSubscriptionIds | Where-Object { $_ -notin $visibleArmIds })
+
+        $preflightDuration  = ((Get-Date) - $preflightStartTime).TotalSeconds
+        $preflightSucceeded = $true
+        Write-Host ("Pre-flight complete in {0:N1}s" -f $preflightDuration) -ForegroundColor DarkGray
+        Write-Host ("  MCSB enabled, will query:        {0}" -f $subsMcsbEnabled.Count) -ForegroundColor Green
+        if ($subsMcsbNotEnabled.Count       -gt 0) { Write-Host ("  MCSB not enabled, skipped:       {0}" -f $subsMcsbNotEnabled.Count)       -ForegroundColor Yellow }
+        if ($subsNoSecurityVisibility.Count -gt 0) { Write-Host ("  No security resources visible:   {0}" -f $subsNoSecurityVisibility.Count) -ForegroundColor Yellow }
+        if ($subsNoSubscriptionAccess.Count -gt 0) { Write-Host ("  No subscription access:          {0}" -f $subsNoSubscriptionAccess.Count) -ForegroundColor Red }
+
+        # Restrict the per-sub loop to MCSB-enabled subscriptions only.
+        $SubscriptionIds = $subsMcsbEnabled
+    } catch {
+        Write-Host ("Pre-flight failed; will query all {0} input subscription(s). Reason: {1}" -f $totalInputSubscriptions, $_.Exception.Message) -ForegroundColor Yellow
+    }
+    Write-Host ""
+}
 
 # Define file names
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -1081,7 +1138,12 @@ Write-Host $separator -ForegroundColor Cyan
 Write-Host " EXPORT SUMMARY" -ForegroundColor Cyan
 Write-Host $separator -ForegroundColor Cyan
 Write-Host ""
-Write-Host ("Total subscriptions queried:           {0}" -f $SubscriptionCount)
+if ($preflightSucceeded -and $totalInputSubscriptions -gt 0) {
+    Write-Host ("Total input subscriptions:             {0}" -f $totalInputSubscriptions)
+    Write-Host ("Subscriptions queried (MCSB enabled):  {0}" -f $SubscriptionCount)
+} else {
+    Write-Host ("Total subscriptions queried:           {0}" -f $SubscriptionCount)
+}
 Write-Host ("Subscriptions with data:               {0}" -f $subsSuccessful.Count) -ForegroundColor Green
 if ($subsNoData.Count -gt 0) {
     Write-Host ("Subscriptions with no data (DfC gap):  {0}" -f $subsNoData.Count) -ForegroundColor Yellow
@@ -1091,6 +1153,17 @@ if ($subsPermissionFail.Count -gt 0) {
 }
 if ($subsOtherFail.Count -gt 0) {
     Write-Host ("Subscriptions failed (other errors):   {0}" -f $subsOtherFail.Count) -ForegroundColor Red
+}
+if ($preflightSucceeded) {
+    if ($subsMcsbNotEnabled.Count -gt 0) {
+        Write-Host ("Skipped - MCSB not enabled:            {0}" -f $subsMcsbNotEnabled.Count) -ForegroundColor Yellow
+    }
+    if ($subsNoSecurityVisibility.Count -gt 0) {
+        Write-Host ("Skipped - no security visibility:      {0}" -f $subsNoSecurityVisibility.Count) -ForegroundColor Yellow
+    }
+    if ($subsNoSubscriptionAccess.Count -gt 0) {
+        Write-Host ("Skipped - no subscription access:      {0}" -f $subsNoSubscriptionAccess.Count) -ForegroundColor Red
+    }
 }
 # Secure-score visibility: surface the X-of-Y rate explicitly so a 1-of-87 case
 # does not get presented as a tenant-wide average.
@@ -1121,11 +1194,21 @@ try {
     $reportLines += ("  Parameter File: {0}" -f $ParameterFile)
     $reportLines += ""
     $reportLines += "EXPORT SUMMARY"
-    $reportLines += ("  Subscriptions queried:              {0}" -f $SubscriptionCount)
+    if ($preflightSucceeded -and $totalInputSubscriptions -gt 0) {
+        $reportLines += ("  Total input subscriptions:          {0}" -f $totalInputSubscriptions)
+        $reportLines += ("  Queried (MCSB enabled):             {0}" -f $SubscriptionCount)
+    } else {
+        $reportLines += ("  Subscriptions queried:              {0}" -f $SubscriptionCount)
+    }
     $reportLines += ("  Subscriptions with data:            {0}" -f $subsSuccessful.Count)
     $reportLines += ("  Subscriptions with no data:         {0}" -f $subsNoData.Count)
     $reportLines += ("  Failed - missing permissions:       {0}" -f $subsPermissionFail.Count)
     $reportLines += ("  Failed - other errors:              {0}" -f $subsOtherFail.Count)
+    if ($preflightSucceeded) {
+        $reportLines += ("  Skipped - MCSB not enabled:         {0}" -f $subsMcsbNotEnabled.Count)
+        $reportLines += ("  Skipped - no security visibility:   {0}" -f $subsNoSecurityVisibility.Count)
+        $reportLines += ("  Skipped - no subscription access:   {0}" -f $subsNoSubscriptionAccess.Count)
+    }
     if (Test-Path $FinalOutputFile) {
         $reportLines += ("  Output file:                        {0}" -f $FinalOutputFile)
         $reportLines += ("  Output size:                        {0}" -f (Get-FormattedFileSize -Bytes (Get-Item $FinalOutputFile).Length))
@@ -1184,7 +1267,38 @@ try {
         foreach ($subId in $subsOtherFail) { $reportLines += "  - $subId" }
         $reportLines += ""
     }
-    if ($subsNoData.Count -gt 0 -or $subsPermissionFail.Count -gt 0) {
+    if ($preflightSucceeded -and $subsMcsbNotEnabled.Count -gt 0) {
+        $reportLines += "SUBSCRIPTIONS SKIPPED - MCSB NOT ENABLED"
+        $reportLines += "  These subscriptions return security findings to ARG but do not have the"
+        $reportLines += "  Microsoft cloud security benchmark (ascScore) initiative assigned, so"
+        $reportLines += "  they cannot produce MCSB-aligned recommendations."
+        $reportLines += "  Action: assign the 'Microsoft cloud security benchmark' policy initiative"
+        $reportLines += "  to these subscriptions (or to a parent management group) so Defender for"
+        $reportLines += "  Cloud can produce a Secure Score baseline."
+        foreach ($subId in $subsMcsbNotEnabled) { $reportLines += "  - $subId" }
+        $reportLines += ""
+    }
+    if ($preflightSucceeded -and $subsNoSecurityVisibility.Count -gt 0) {
+        $reportLines += "SUBSCRIPTIONS SKIPPED - NO SECURITY VISIBILITY"
+        $reportLines += "  These subscriptions returned zero rows from the 'securityresources' table."
+        $reportLines += "  Action: verify that the Security Reader (or Reader) role is assigned to the"
+        $reportLines += "  running identity on these subscriptions, and that MCSB is enabled on this"
+        $reportLines += "  subscription."
+        foreach ($subId in $subsNoSecurityVisibility) { $reportLines += "  - $subId" }
+        $reportLines += ""
+    }
+    if ($preflightSucceeded -and $subsNoSubscriptionAccess.Count -gt 0) {
+        $reportLines += "SUBSCRIPTIONS SKIPPED - NO SUBSCRIPTION ACCESS"
+        $reportLines += "  These subscription IDs were not visible at ARM at all (Azure Resource Graph"
+        $reportLines += "  reported no 'microsoft.resources/subscriptions' container for them)."
+        $reportLines += "  Action: confirm the subscription IDs are correct and that the running"
+        $reportLines += "  identity has at least Reader role on each subscription (or a parent"
+        $reportLines += "  management group)."
+        foreach ($subId in $subsNoSubscriptionAccess) { $reportLines += "  - $subId" }
+        $reportLines += ""
+    }
+    $hasPreflightGap = $preflightSucceeded -and ($subsMcsbNotEnabled.Count -gt 0 -or $subsNoSecurityVisibility.Count -gt 0 -or $subsNoSubscriptionAccess.Count -gt 0)
+    if ($subsNoData.Count -gt 0 -or $subsPermissionFail.Count -gt 0 -or $hasPreflightGap) {
         $reportLines += "NEXT STEPS"
         $reportLines += "  - Engage the CSA to remediate the gaps listed above before continuing."
         $reportLines += "  - Or proceed with the ESA based on the current data quality."
@@ -1202,7 +1316,7 @@ try {
     $reportLines += "  XDR and Purview data must be exported manually."
     $reportLines | Out-File -FilePath $ReportFile -Encoding UTF8
     Write-Host ("Export report saved: {0}" -f $ReportFile) -ForegroundColor Green
-    if ($subsNoData.Count -gt 0 -or $subsPermissionFail.Count -gt 0 -or $subsOtherFail.Count -gt 0 -or $subsSecureScoreFailed.Count -gt 0) {
+    if ($subsNoData.Count -gt 0 -or $subsPermissionFail.Count -gt 0 -or $subsOtherFail.Count -gt 0 -or $subsSecureScoreFailed.Count -gt 0 -or ($preflightSucceeded -and ($subsMcsbNotEnabled.Count -gt 0 -or $subsNoSecurityVisibility.Count -gt 0 -or $subsNoSubscriptionAccess.Count -gt 0))) {
         Write-Host ("ATTENTION: Data quality gaps detected. See report file {0} for details." -f $ReportFile) -ForegroundColor Yellow
     }
 } catch {
