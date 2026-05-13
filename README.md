@@ -27,10 +27,12 @@ This script requires the following Azure PowerShell modules:
 - `Az.Accounts`  
 - `Az.ResourceGraph`
 
-The script checks for the required Azure PowerShell modules. If any are missing, it will notify you and provide installation instructions:
+The script checks for the required modules at startup. If any are missing, it will offer to install them for you (CurrentUser scope, no admin rights required). You can also install them manually:
 ```powershell
-Install-Module Az.Accounts, Az.ResourceGraph -Force
+Install-Module Az.Accounts, Az.ResourceGraph -Scope CurrentUser -Force
 ```
+
+> **Optional (parallel mode only):** If you enable `"Parallel": true` (see below), the script also needs the `ThreadJob` module. It will detect and offer to install it on first use - no manual setup required.
 
 ## Usage
 
@@ -51,7 +53,7 @@ To export both MDC and MCSB data, run the script twice - once with each paramete
 
 **Retry Logic:** The script retries transient Azure Resource Graph failures automatically. General transient failures (`GatewayTimeout`, `InternalServerError`, `ServiceUnavailable`, network errors, TLS resets) use *exponential backoff* with up to 3 retries (delays of 4 / 8 / 16 seconds). Resource Graph throttling (`RateLimiting`, `TooManyRequests`) uses a more patient *linear* policy with up to 10 retries (delays of 5, 10, 15, … seconds) before a subscription is marked as failed. Status messages are shown during retries.
 
-**Parallel Execution (opt-in):** By default the script processes subscriptions one at a time. To speed up large tenants, set `"ParallelWorkers": N` (2–50) in the JSON parameter file. The parallel path requires the `ThreadJob` module (`Install-Module ThreadJob -Scope CurrentUser`) and uses an in-memory bearer token (never written to disk). Each worker writes its own temporary CSV fragment; the script merges them into the final CSV in original subscription order after all workers finish. Note: the captured token is valid for ~60 minutes; for very long runs prefer `ParallelWorkers: 1` (the serial path uses the Az SDK and auto-refreshes the token).
+**Parallel Execution (opt-in, EXPERIMENTAL):** By default the script processes subscriptions one at a time using the supported serial path (works on Windows PowerShell 5.1 and PowerShell 7+). To speed up large tenants, set `"Parallel": true` in the JSON parameter file - the script auto-sizes the worker pool based on the number of subscriptions. The parallel path is **experimental** and requires **PowerShell 7 or later** (Windows PowerShell 5.1 is not supported in this mode) plus the `ThreadJob` module (the script will offer to install it if missing). Each worker writes its own temporary CSV fragment; the script merges them into the final CSV in original subscription order after all workers finish.
 
 **Error Logging:** If any errors occur during the execution of the KQL query, they will be logged in a file with the `.failed` extension.
 
@@ -90,12 +92,12 @@ This JSON file defines input parameters for the `ESA_MDC_DataExport.ps1` script 
   "CSVFileName": "Export_MDC_Recommendations.csv",
   "QueryFile": "MDC.kql",
   "SubscriptionIds": ["*"],
-  "ParallelWorkers": 1,
+  "Parallel": false,
   "_comments": {
     "CSVFileName": "Final CSV output file for Power BI import",
     "QueryFile": "KQL Query file. Do not change!",
     "SubscriptionIds": "Comma-separated subscription IDs or '*' for all available subscriptions. If you specify specific subscriptions, ensure you connect to the correct tenant (if you have access to multiple tenants) during script execution. If you don't have access to some subscriptions, the script will continue with the remaining ones.",
-    "ParallelWorkers": "Default 1 (serial). Set to 2-50 to query subscriptions in parallel."
+    "Parallel": "Default false. Set to true to query subscriptions in parallel for faster runs on large tenants - the script auto-sizes the worker pool. EXPERIMENTAL: requires PowerShell 7+ AND the 'ThreadJob' module (the script will offer to install it)."
   }
 }
 ```
@@ -105,7 +107,7 @@ This JSON file defines input parameters for the `ESA_MDC_DataExport.ps1` script 
 | `CSVFileName`     | The name of the file containing the exported MDC recommendations. This file needs to be imported into the Power BI report. You may change it, but it is recommended to keep the default value.                                                                                            |
 | `QueryFile`       | The file containing the KQL query. **Do not modify.**                                                                                                                                                                                                                                      |
 | `SubscriptionIds` | To export data for all available subscriptions, keep the default value `'*'`. Otherwise, specify the subscription IDs to be exported. Example: `["09b43e75...", "4fc2c46b...", ...]`<br>If you don’t have access to some subscriptions, the script will continue with the remaining ones. |
-| `ParallelWorkers` | Default `1` (serial, recommended for most users). Set to `2`–`50` to query subscriptions in parallel for faster runs on large tenants. Values >1 require the `ThreadJob` module (`Install-Module ThreadJob -Scope CurrentUser`) and capture a one-shot bearer token (~60 min lifetime).      |
+| `Parallel`       | Default `false` (serial). Set to `true` to query subscriptions in parallel for faster runs on large tenants - the script auto-sizes the worker pool. **EXPERIMENTAL** and requires **PowerShell 7+** plus the `ThreadJob` module (the script will offer to install it if missing). Not supported on Windows PowerShell 5.1.      |
 
 
 
@@ -122,12 +124,12 @@ This JSON file defines input parameters for the `ESA_MDC_DataExport.ps1` script 
   "CSVFileName": "Export_MCSB_Compliance.csv",
   "QueryFile": "MCSB.kql",
   "SubscriptionIds": ["*"],
-  "ParallelWorkers": 1,
+  "Parallel": false,
   "_comments": {
     "CSVFileName": "Final CSV output file for Power BI import",
     "QueryFile": "KQL Query file. Do not change!",
     "SubscriptionIds": "Comma-separated subscription IDs or '*' for all available subscriptions. If you specify specific subscriptions, ensure you connect to the correct tenant (if you have access to multiple tenants) during script execution. If you don't have access to some subscriptions, the script will continue with the remaining ones.",
-    "ParallelWorkers": "Default 1 (serial). Set to 2-50 to query subscriptions in parallel."
+    "Parallel": "Default false. Set to true to query subscriptions in parallel for faster runs on large tenants - the script auto-sizes the worker pool. EXPERIMENTAL: requires PowerShell 7+ AND the 'ThreadJob' module (the script will offer to install it)."
   }
 }
 ```
@@ -139,7 +141,7 @@ This JSON file defines input parameters for the `ESA_MDC_DataExport.ps1` script 
 | `CSVFileName`      | The name of the file containing the exported MCSB recommendations. This file needs to be imported into the Power BI report. You may change it, but it is recommended to keep the default value.                                                                                          |
 | `QueryFile`        | The file containing the KQL query. **Do not modify.**                                                                                                                                                                                                                                      |
 | `SubscriptionIds`  | To export data for all available subscriptions, keep the default value `'*'`. Otherwise, specify the subscription IDs to be exported. Example: `["09b43e75...", "4fc2c46b...", ...]`<br>If you don’t have access to some subscriptions, the script will continue with the remaining ones. |
-| `ParallelWorkers`  | Default `1` (serial, recommended for most users). Set to `2`–`50` to query subscriptions in parallel for faster runs on large tenants. Values >1 require the `ThreadJob` module (`Install-Module ThreadJob -Scope CurrentUser`) and capture a one-shot bearer token (~60 min lifetime).      |
+| `Parallel`         | Default `false` (serial). Set to `true` to query subscriptions in parallel for faster runs on large tenants - the script auto-sizes the worker pool. **EXPERIMENTAL** and requires **PowerShell 7+** plus the `ThreadJob` module (the script will offer to install it if missing). Not supported on Windows PowerShell 5.1.      |
 
 ## 📦 Downloads
 

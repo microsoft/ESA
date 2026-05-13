@@ -2,11 +2,12 @@
     "CSVFileName": "Export_MDC_Recommendations.csv",
     "QueryFile": "MDC.kql",
     "SubscriptionIds": ["*"],
-    "ParallelWorkers": 1,
+    "Parallel": false,
     "_comments": {
         "CSVFileName": "Final CSV output file for Power BI import",
         "QueryFile": "KQL Query file. Do not change!",
         "SubscriptionIds": "Comma-separated subscription IDs or '*' for all available subscriptions. If you specify specific subscriptions, ensure you connect to the correct tenant (if you have access to multiple tenants) during script execution. If you don't have access to some subscriptions, the script will continue with the remaining ones.",
-        "ParallelWorkers": "Default 1 (serial). Set to 2-50 to query subscriptions in parallel for faster runs on large tenants. Values >1 require the 'ThreadJob' module (Install-Module ThreadJob -Scope CurrentUser) and capture a one-shot bearer token (~60 min lifetime). Use 1 for very long runs (Az SDK auto-refreshes the token)."
+        "Parallel": "Default false. Set to true to query subscriptions in parallel for faster runs on large tenants - the script auto-sizes the worker pool. EXPERIMENTAL: requires PowerShell 7+ AND the 'ThreadJob' module (the script will offer to install it)."
     }
 }
+

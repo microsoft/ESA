@@ -59,12 +59,36 @@ foreach ($module in $requiredModules) {
 
 # Display message if modules are missing
 if ($missingModules.Count -gt 0) {
-    Write-Host "The following required PowerShell modules are missing:" -ForegroundColor Red
+    Write-Host "The following required PowerShell modules are missing:" -ForegroundColor Yellow
     Write-Host "  $($missingModules -join ', ')" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "Please install them using the following command:" -ForegroundColor Cyan
-    Write-Host "  Install-Module $($missingModules -join ', ') -Force" -ForegroundColor Green
-    exit 1
+    $response = Read-Host "Install missing module(s) now from PSGallery (CurrentUser scope)? [Y/n]"
+    if ([string]::IsNullOrWhiteSpace($response) -or $response -match '^(y|yes)$') {
+        try {
+            Write-Host "Installing: $($missingModules -join ', ') (CurrentUser scope)..." -ForegroundColor Cyan
+            Install-Module -Name $missingModules -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            # Verify
+            $stillMissing = @()
+            foreach ($module in $missingModules) {
+                if (-not (Get-Module -ListAvailable -Name $module)) {
+                    $stillMissing += $module
+                }
+            }
+            if ($stillMissing.Count -gt 0) {
+                Write-Host "Error: installation reported success but the following module(s) are still not available: $($stillMissing -join ', ')" -ForegroundColor Red
+                exit 1
+            }
+            Write-Host "Module(s) installed successfully." -ForegroundColor Green
+        } catch {
+            Write-Host "Error: failed to install module(s): $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  Try manually: Install-Module $($missingModules -join ', ') -Scope CurrentUser -Force -AllowClobber" -ForegroundColor Green
+            exit 1
+        }
+    } else {
+        Write-Host "Cannot continue without required modules. Install manually with:" -ForegroundColor Cyan
+        Write-Host "  Install-Module $($missingModules -join ', ') -Scope CurrentUser -Force" -ForegroundColor Green
+        exit 1
+    }
 }
 
 # Ensure parameter file exists
@@ -86,25 +110,65 @@ if (-Not $parameters.CSVFileName) {
     exit 1
 }
 
-# Parse ParallelWorkers (default 1 = serial, opt-in parallelism via JSON)
-$ParallelWorkers = 1
-if ($null -ne $parameters.ParallelWorkers) {
-    $parsedWorkers = 0
-    if (-not [int]::TryParse([string]$parameters.ParallelWorkers, [ref]$parsedWorkers)) {
-        Write-Host "Error: ParallelWorkers must be an integer between 1 and 50." -ForegroundColor Red
+# Parse parallel-mode configuration.
+#   * 'Parallel' (bool, default false) - simple opt-in. When true, the script
+#     auto-sizes the worker pool from the subscription count using:
+#       subscriptions <= 4 -> workers = subscriptions (1 worker per sub)
+#       subscriptions > 4  -> workers = ceil(subscriptions / 2), capped at 20
+# (No manual override; the auto-size rule above is the only knob.)
+$Parallel = $false
+if ($null -ne $parameters.Parallel) {
+    try {
+        $Parallel = [bool]::Parse([string]$parameters.Parallel)
+    } catch {
+        Write-Host "Error: 'Parallel' must be true or false (got: $($parameters.Parallel))." -ForegroundColor Red
         exit 1
     }
-    $ParallelWorkers = $parsedWorkers
 }
-if ($ParallelWorkers -lt 1 -or $ParallelWorkers -gt 50) {
-    Write-Host "Error: ParallelWorkers must be between 1 and 50 (got: $ParallelWorkers)." -ForegroundColor Red
-    exit 1
-}
-if ($ParallelWorkers -gt 1) {
-    if (-not (Get-Module -ListAvailable -Name ThreadJob)) {
-        Write-Host "Error: ParallelWorkers > 1 requires the 'ThreadJob' module." -ForegroundColor Red
-        Write-Host "  Install with: Install-Module ThreadJob -Scope CurrentUser" -ForegroundColor Green
+# $ParallelWorkers is computed later (after sub list is built). Default = 1 (serial).
+$ParallelWorkers = 1
+
+# PS7 + ThreadJob prerequisites. Run when parallel mode is requested.
+if ($Parallel) {
+    # Parallel mode is an EXPERIMENTAL feature and requires PowerShell 7+.
+    # On Windows PowerShell 5.1 the parallel code path is intentionally blocked
+    # because the ARG REST + ThreadJob combination is only validated on PS 7+.
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        Write-Host "Error: Parallel mode requires PowerShell 7 or later (current: $($PSVersionTable.PSVersion))." -ForegroundColor Red
+        Write-Host "  Install PowerShell 7+: https://aka.ms/powershell" -ForegroundColor Green
+        Write-Host "  Or set 'Parallel': false in the JSON to use the supported serial path." -ForegroundColor Green
         exit 1
+    }
+    # Check whether Start-ThreadJob is available. It can be provided by either:
+    #   * 'ThreadJob' (PSGallery, required on Windows PowerShell 5.1)
+    #   * 'Microsoft.PowerShell.ThreadJob' (built-in starting with PowerShell 7)
+    # Get-Command works for both, since the cmdlet name is the same.
+    if (-not (Get-Command -Name Start-ThreadJob -ErrorAction SilentlyContinue)) {
+        Write-Host ""
+        Write-Host "Parallel mode requires the 'Start-ThreadJob' cmdlet, which is not currently available." -ForegroundColor Yellow
+        Write-Host "It is provided by the 'ThreadJob' module from the PowerShell Gallery." -ForegroundColor Yellow
+        $response = Read-Host "Install 'ThreadJob' module now from PSGallery (CurrentUser scope)? [Y/n]"
+        if ([string]::IsNullOrWhiteSpace($response) -or $response -match '^[Yy]') {
+            try {
+                Write-Host "Installing 'ThreadJob' module (CurrentUser scope, -AllowClobber)..." -ForegroundColor Cyan
+                # -AllowClobber handles the case where Start-ThreadJob is already provided
+                # by another (built-in) module on this machine.
+                Install-Module -Name ThreadJob -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+                if (-not (Get-Command -Name Start-ThreadJob -ErrorAction SilentlyContinue)) {
+                    Write-Host "Error: installation reported success but 'Start-ThreadJob' is still not available." -ForegroundColor Red
+                    Write-Host "  Open a new PowerShell session and re-run the script." -ForegroundColor Green
+                    exit 1
+                }
+                Write-Host "'ThreadJob' module installed successfully." -ForegroundColor Green
+            } catch {
+                Write-Host "Error: failed to install 'ThreadJob' module: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "  Try manually: Install-Module ThreadJob -Scope CurrentUser -AllowClobber" -ForegroundColor Green
+                exit 1
+            }
+        } else {
+            Write-Host "Aborted by user. Set 'Parallel': false in the JSON to use the serial path." -ForegroundColor Yellow
+            exit 1
+        }
     }
 }
 
@@ -380,7 +444,12 @@ function Invoke-SearchAzGraphWithRetry {
                 [math]::Pow(2, $retryCount) * $RetryDelaySeconds
             }
             $reason = if ([string]::IsNullOrWhiteSpace($errorCode)) { "Unknown" } else { $errorCode }
-            Write-Host "Warning: $OperationName for subscription $SubscriptionId hit $reason. Retrying in $backoffDelay seconds... (Attempt $retryCount of $retryLimit)" -ForegroundColor Yellow
+            # Skip the first rate-limit warning - the first retry almost always
+            # succeeds and the noise is more confusing than helpful. Surface it
+            # only from attempt 2 onwards (or immediately for non-rate-limit errors).
+            if (-not ($isRateLimited -and $retryCount -eq 1)) {
+                Write-Host "Warning: $OperationName for subscription $SubscriptionId hit $reason. Retrying in $backoffDelay seconds... (Attempt $retryCount of $retryLimit)" -ForegroundColor Yellow
+            }
             Start-Sleep -Seconds $backoffDelay
         }
     }
@@ -469,6 +538,16 @@ $workItems = for ($i = 0; $i -lt $SubscriptionIds.Count; $i++) {
     }
 }
 $TotalSubscriptions = $workItems.Count
+# Auto-size the worker pool when Parallel=true:
+#   subscriptions <= 4 -> workers = subscriptions
+#   subscriptions > 4  -> workers = ceil(subscriptions / 2), capped at 20
+if ($Parallel -and $TotalSubscriptions -gt 0) {
+    if ($TotalSubscriptions -le 4) {
+        $ParallelWorkers = $TotalSubscriptions
+    } else {
+        $ParallelWorkers = [int][Math]::Min(20, [Math]::Ceiling($TotalSubscriptions / 2.0))
+    }
+}
 $workerResults     = @()
 $RunTempDirectory  = $null
 $cleanupRunTempDirectory = $false
@@ -479,20 +558,24 @@ $cleanupRunTempDirectory = $false
 try {
     if ($ParallelWorkers -gt 1) {
         # ------------------------------------------------------------
-        # Parallel execution path (ThreadJob + ARG REST API)
+        # Parallel execution path (ThreadJob + Search-AzGraph)
+        #
+        # ThreadJob workers run in separate runspaces inside the SAME process,
+        # so they share Az session state. We force in-memory (process-scope)
+        # context to avoid any disk autosave races, then explicitly Set-AzContext
+        # in each worker as belt-and-suspenders. No bearer token capture, no
+        # REST endpoint - the Az SDK handles auth, refresh, and pagination.
         # ------------------------------------------------------------
 
         $RunTempDirectory = Join-Path -Path (Get-Location).Path -ChildPath "$BaseFileName`_$Timestamp.parts"
         New-Item -ItemType Directory -Path $RunTempDirectory -Force | Out-Null
 
-        # Derive ARM endpoint from current Az environment (works for AzureCloud + AzureUSGovernment)
-        $azContextNow      = Get-AzContext
-        $resourceManagerUrl = $azContextNow.Environment.ResourceManagerUrl.TrimEnd('/')
-        $argEndpoint       = "$resourceManagerUrl/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01"
-
-        # Bearer token (env-aware via the current Az context). Captured once.
-        # The token is held only in process memory and passed by argument to workers.
-        $accessToken = (Get-AzAccessToken -ResourceUrl ($resourceManagerUrl + '/') -TenantId $tenantId -ErrorAction Stop).Token
+        # Make Az context process-scoped (in-memory only). Idempotent and safe.
+        Disable-AzContextAutosave -Scope Process -ErrorAction SilentlyContinue | Out-Null
+        $sharedContext = Get-AzContext
+        if (-not $sharedContext) {
+            throw "No Az context available; cannot proceed with parallel mode."
+        }
 
         # Synchronized progress counter so output is monotonic across workers.
         $progressState = [hashtable]::Synchronized(@{
@@ -500,128 +583,111 @@ try {
             Total     = $TotalSubscriptions
         })
 
-        Import-Module ThreadJob -ErrorAction Stop | Out-Null
+        # Auto-detect which ThreadJob module to import (Start-ThreadJob may be
+        # provided by either the gallery 'ThreadJob' module or the built-in
+        # 'Microsoft.PowerShell.ThreadJob' module that ships with PowerShell 7).
+        $threadJobModuleName = if (Get-Module -ListAvailable -Name 'ThreadJob' -ErrorAction SilentlyContinue) {
+            'ThreadJob'
+        } elseif (Get-Module -ListAvailable -Name 'Microsoft.PowerShell.ThreadJob' -ErrorAction SilentlyContinue) {
+            'Microsoft.PowerShell.ThreadJob'
+        } else {
+            $null
+        }
+        if ($threadJobModuleName) {
+            Import-Module $threadJobModuleName -ErrorAction Stop | Out-Null
+        } elseif (-not (Get-Command -Name Start-ThreadJob -ErrorAction SilentlyContinue)) {
+            throw "Start-ThreadJob cmdlet is not available and no ThreadJob module was found."
+        }
 
         Write-Host "Starting parallel export with $ParallelWorkers workers across $TotalSubscriptions subscriptions..." -ForegroundColor Cyan
-        Write-Host "Note: the bearer token captured at start expires in ~60 minutes. For larger tenants, prefer ParallelWorkers=1 (serial) which auto-refreshes via the Az SDK." -ForegroundColor DarkGray
+        Write-Host "Informational: parallel mode is an EXPERIMENTAL feature." -ForegroundColor DarkGray
 
-        $workerScript = {
-            param(
-                $work, $endpoint, $token, $kql, $ssQuery, $countQuery,
-                $pageSize, $runTempDir, $progress
-            )
+        # InitializationScript runs once per worker runspace. We use it to import
+        # the Az modules (so Search-AzGraph is available) and to define a small
+        # retry helper that mirrors the serial path's Invoke-SearchAzGraphWithRetry.
+        # Function names are kept distinct ('Worker*') so they can't collide with
+        # the parent's helpers if PS happens to share scope.
+        $initScript = {
+            Import-Module Az.Accounts -ErrorAction Stop | Out-Null
+            Import-Module Az.ResourceGraph -ErrorAction Stop | Out-Null
 
-            $subscriptionId    = $work.SubscriptionId
-            $subscriptionIndex = $work.Index
-            $csvFragment       = Join-Path $runTempDir ("{0:D6}_{1}.csv"    -f $subscriptionIndex, $subscriptionId)
-            $failedFragment    = Join-Path $runTempDir ("{0:D6}_{1}.failed" -f $subscriptionIndex, $subscriptionId)
-            $secureScore        = $null
-            $retrievedRecords   = 0
-            $totalRecords       = 0
-            $subscriptionFailed = $false
-            $failureMessage     = $null
+            function Get-WorkerRGErrorCode {
+                param([Parameter(Mandatory)] $ErrorRecord)
+                $rawContent = $null
+                if ($ErrorRecord.Exception -and $ErrorRecord.Exception.PSObject.Properties['Response'] `
+                    -and $ErrorRecord.Exception.Response -and $ErrorRecord.Exception.Response.PSObject.Properties['Content']) {
+                    $rawContent = $ErrorRecord.Exception.Response.Content
+                }
+                if (-not $rawContent) { return "Unknown" }
+                try {
+                    $details = $rawContent | ConvertFrom-Json -ErrorAction Stop
+                    if ($details -and $details.error -and $details.error.code) {
+                        return [string]$details.error.code
+                    }
+                } catch { }
+                return "Unknown"
+            }
 
-            # ---- Inline ARG REST query with retry (mirrors Invoke-SearchAzGraphWithRetry) ----
-            function Invoke-ArgRestWithRetry {
+            function Test-WorkerRetriableRGError {
                 param(
-                    [string] $SubscriptionId,
-                    [string] $Query,
-                    [int]    $First,
-                    [int]    $Skip,
-                    [string] $OperationName,
-                    [string] $Endpoint,
-                    [string] $Token
+                    [Parameter(Mandatory)] $ErrorRecord,
+                    [string] $ErrorCode = "Unknown"
                 )
+                if ($ErrorCode -in @("GatewayTimeout", "InternalServerError", "ServiceUnavailable", "RateLimiting", "TooManyRequests")) {
+                    return $true
+                }
+                $errorText = $ErrorRecord | Out-String
+                if ($errorText -match "RateLimiting|TooManyRequests|throttled") { return $true }
+                $exception = $ErrorRecord.Exception
+                while ($exception) {
+                    if ($exception -is [System.TimeoutException] -or
+                        $exception -is [System.Threading.Tasks.TaskCanceledException] -or
+                        $exception -is [System.OperationCanceledException] -or
+                        $exception -is [System.Net.Http.HttpRequestException] -or
+                        $exception -is [System.IO.IOException]) {
+                        return $true
+                    }
+                    $exception = $exception.InnerException
+                }
+                return ($errorText -match "task was canceled|timed out|connection reset by peer|ssl connection could not be established|error while copying content to a stream")
+            }
 
+            function Invoke-WorkerSearchAzGraph {
+                param(
+                    [Parameter(Mandatory)] [string] $SubscriptionId,
+                    [Parameter(Mandatory)] [string] $Query,
+                    [Parameter(Mandatory)] [int]    $First,
+                    [int]    $Skip = 0,
+                    [string] $OperationName = "Resource Graph query",
+                    [System.Collections.Generic.List[string]] $OutputBuffer
+                )
                 $maxRetries                 = 3
                 $retryDelaySeconds          = 2
                 $rateLimitMaxRetries        = 10
                 $rateLimitRetryDelaySeconds = 5
                 $retryCount                 = 0
 
-                $headers = @{
-                    Authorization  = "Bearer $Token"
-                    'Content-Type' = 'application/json'
-                }
-
                 while ($true) {
                     try {
-                        $body = @{
-                            subscriptions = @($SubscriptionId)
-                            query         = $Query
-                            options       = @{
-                                '$top'       = $First
-                                '$skip'      = $Skip
-                                resultFormat = 'objectArray'
-                            }
-                        } | ConvertTo-Json -Depth 5 -Compress
-
-                        $response = Invoke-RestMethod -Method Post -Uri $Endpoint -Headers $headers -Body $body -ErrorAction Stop
-
-                        $rows = @()
-                        if ($null -ne $response.data) {
-                            $rows = @($response.data)
+                        if ($Skip -gt 0) {
+                            $result = @(Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -Skip $Skip -ErrorAction Stop)
+                        } else {
+                            $result = @(Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -ErrorAction Stop)
                         }
-
                         return [pscustomobject]@{
                             Succeeded    = $true
-                            Result       = $rows
+                            Result       = $result
                             ErrorMessage = $null
                             ErrorCode    = $null
                         }
                     } catch {
                         $errorRecord  = $_
                         $errorMessage = $errorRecord | Format-List -Force | Out-String
-                        $errorCode    = "Unknown"
-
-                        # Try to parse error code from REST response body
-                        try {
-                            $errResponse = $errorRecord.Exception.Response
-                            $body = $null
-                            if ($errResponse) {
-                                if ($errResponse -is [System.Net.Http.HttpResponseMessage]) {
-                                    $body = $errResponse.Content.ReadAsStringAsync().Result
-                                } elseif ($errResponse.GetResponseStream) {
-                                    $stream = $errResponse.GetResponseStream()
-                                    $reader = [System.IO.StreamReader]::new($stream)
-                                    $body = $reader.ReadToEnd()
-                                    $reader.Dispose()
-                                }
-                            }
-                            if (-not $body -and $errorRecord.ErrorDetails) {
-                                $body = $errorRecord.ErrorDetails.Message
-                            }
-                            if ($body) {
-                                $details = $body | ConvertFrom-Json -ErrorAction Stop
-                                if ($details -and $details.error -and $details.error.code) {
-                                    $errorCode = [string]$details.error.code
-                                }
-                            }
-                        } catch {
-                            Write-Debug "Invoke-ArgRestWithRetry: failed to parse error body as JSON; errorCode left as 'Unknown'."
-                        }
-
-                        $errorText  = $errorRecord | Out-String
-                        $isRetriable = ($errorCode -in @("GatewayTimeout", "InternalServerError", "ServiceUnavailable", "RateLimiting", "TooManyRequests")) -or
-                                       ($errorText -match "RateLimiting|TooManyRequests|throttled|task was canceled|timed out|connection reset by peer|ssl connection could not be established|error while copying content to a stream")
-                        if (-not $isRetriable) {
-                            $exception = $errorRecord.Exception
-                            while ($exception) {
-                                if ($exception -is [System.TimeoutException] -or
-                                    $exception -is [System.Threading.Tasks.TaskCanceledException] -or
-                                    $exception -is [System.OperationCanceledException] -or
-                                    $exception -is [System.Net.Http.HttpRequestException] -or
-                                    $exception -is [System.IO.IOException]) {
-                                    $isRetriable = $true
-                                    break
-                                }
-                                $exception = $exception.InnerException
-                            }
-                        }
-
+                        $errorCode    = Get-WorkerRGErrorCode -ErrorRecord $errorRecord
+                        $isRetriable  = Test-WorkerRetriableRGError -ErrorRecord $errorRecord -ErrorCode $errorCode
                         $isRateLimited = ($errorCode -in @("RateLimiting", "TooManyRequests")) -or
-                                         ($errorText -match "RateLimiting|TooManyRequests|throttled")
-                        $retryLimit = if ($isRateLimited) { $rateLimitMaxRetries } else { $maxRetries }
+                                         (($errorRecord | Out-String) -match "RateLimiting|TooManyRequests|throttled")
+                        $retryLimit   = if ($isRateLimited) { $rateLimitMaxRetries } else { $maxRetries }
 
                         if (-not $isRetriable -or $retryCount -ge $retryLimit) {
                             return [pscustomobject]@{
@@ -639,24 +705,57 @@ try {
                             [math]::Pow(2, $retryCount) * $retryDelaySeconds
                         }
                         $reason = if ([string]::IsNullOrWhiteSpace($errorCode)) { "Unknown" } else { $errorCode }
-                        Write-Host "Warning: $OperationName for subscription $SubscriptionId hit $reason. Retrying in $backoffDelay seconds... (Attempt $retryCount of $retryLimit)" -ForegroundColor Yellow
+                        # Skip the first rate-limit warning (the first retry almost
+                        # always succeeds). Surface it only from attempt 2 onwards.
+                        if (-not ($isRateLimited -and $retryCount -eq 1)) {
+                            $msg = "Warning: $OperationName for subscription $SubscriptionId hit $reason. Retrying in $backoffDelay seconds... (Attempt $retryCount of $retryLimit)"
+                            if ($OutputBuffer) { $OutputBuffer.Add($msg) | Out-Null } else { Write-Host $msg -ForegroundColor Yellow }
+                        }
                         Start-Sleep -Seconds $backoffDelay
                     }
                 }
             }
+        }
+
+        $workerScript = {
+            param(
+                $work, $sharedContext, $kql, $ssQuery, $countQuery,
+                $pageSize, $runTempDir, $progress
+            )
+
+            # Belt-and-suspenders: explicitly set the Az context in this worker's
+            # runspace. Disable-AzContextAutosave -Scope Process in the parent
+            # already shares context, but Set-AzContext makes it deterministic.
+            Set-AzContext -Context $sharedContext -ErrorAction Stop | Out-Null
+
+            $subscriptionId    = $work.SubscriptionId
+            $subscriptionIndex = $work.Index
+            $csvFragment       = Join-Path $runTempDir ("{0:D6}_{1}.csv"    -f $subscriptionIndex, $subscriptionId)
+            $failedFragment    = Join-Path $runTempDir ("{0:D6}_{1}.failed" -f $subscriptionIndex, $subscriptionId)
+            $secureScore        = $null
+            $retrievedRecords   = 0
+            $totalRecords       = 0
+            $subscriptionFailed = $false
+            $failureMessage     = $null
+
+            # Buffer per-sub output so the entire block prints atomically (in
+            # completion order) when the worker finishes. Output format matches
+            # the serial path line-for-line.
+            $outputBuffer = New-Object 'System.Collections.Generic.List[string]'
+            $outputBuffer.Add(("[{0}/{1}] Querying subscription: {2}" -f $subscriptionIndex, $progress.Total, $subscriptionId)) | Out-Null
 
             # Secure score (best-effort)
             try {
-                $ssResult = Invoke-ArgRestWithRetry -SubscriptionId $subscriptionId -Query $ssQuery -First 1 -Skip 0 -OperationName "Secure score query" -Endpoint $endpoint -Token $token
+                $ssResult = Invoke-WorkerSearchAzGraph -SubscriptionId $subscriptionId -Query $ssQuery -First 1 -OperationName "Secure score query" -OutputBuffer $outputBuffer
                 if ($ssResult.Succeeded -and $ssResult.Result.Count -gt 0 -and $ssResult.Result[0].subscriptionSecureScore) {
                     $secureScore = [double]$ssResult.Result[0].subscriptionSecureScore
                 }
             } catch {
-                Write-Verbose "Secure score query failed for $subscriptionId"
+                # silent best-effort; matches serial behavior
             }
 
             # Total records (best-effort)
-            $countResult = Invoke-ArgRestWithRetry -SubscriptionId $subscriptionId -Query $countQuery -First 1 -Skip 0 -OperationName "Record count query" -Endpoint $endpoint -Token $token
+            $countResult = Invoke-WorkerSearchAzGraph -SubscriptionId $subscriptionId -Query $countQuery -First 1 -OperationName "Record count query" -OutputBuffer $outputBuffer
             if ($countResult.Succeeded -and $countResult.Result.Count -gt 0 -and $countResult.Result[0].totalRecords) {
                 $totalRecords = [int64]$countResult.Result[0].totalRecords
             }
@@ -664,8 +763,9 @@ try {
             # Page through results
             $skip = 0
             while ($true) {
-                $pageResult = Invoke-ArgRestWithRetry -SubscriptionId $subscriptionId -Query $kql -First $pageSize -Skip $skip -OperationName "Recommendation query" -Endpoint $endpoint -Token $token
+                $pageResult = Invoke-WorkerSearchAzGraph -SubscriptionId $subscriptionId -Query $kql -First $pageSize -Skip $skip -OperationName "Recommendation query" -OutputBuffer $outputBuffer
                 if (-not $pageResult.Succeeded) {
+                    $outputBuffer.Add("Warning: Error executing query for subscription $subscriptionId") | Out-Null
                     Add-Content -Path $failedFragment -Value "Subscription ID: $subscriptionId - Error: $($pageResult.ErrorMessage)" -Encoding UTF8
                     $subscriptionFailed = $true
                     $failureMessage = $pageResult.ErrorMessage
@@ -674,7 +774,10 @@ try {
 
                 $batch = $pageResult.Result
                 $batchCount = $batch.Count
-                if ($batchCount -eq 0) { break }
+                if ($batchCount -eq 0) {
+                    $outputBuffer.Add("Subscription $subscriptionId - Retrieved 0 records") | Out-Null
+                    break
+                }
 
                 $batch | ForEach-Object {
                     $_.PSObject.Properties | Where-Object { $_.Value -is [datetime] } | ForEach-Object {
@@ -685,21 +788,30 @@ try {
 
                 $retrievedRecords += $batchCount
                 $skip += $pageSize
+                $remainingRecords = [Math]::Max(0, $totalRecords - $retrievedRecords)
+                $outputBuffer.Add("Subscription $subscriptionId - Retrieved $batchCount records, remaining: $remainingRecords") | Out-Null
+
                 if ($batchCount -lt $pageSize) { break }
             }
 
-            # Increment ordered progress counter and emit a single status line
+            # Print buffered lines atomically (per-sub block, in completion order).
             [System.Threading.Monitor]::Enter($progress.SyncRoot)
             try {
                 $progress.Completed++
-                $position = $progress.Completed
+                foreach ($line in $outputBuffer) {
+                    if ($line -match '^Warning:') {
+                        Write-Host $line -ForegroundColor Yellow
+                    } elseif ($line -match '- Retrieved 0 records') {
+                        Write-Host $line -ForegroundColor Yellow
+                    } elseif ($line -match '- Retrieved') {
+                        Write-Host $line -ForegroundColor Green
+                    } else {
+                        Write-Host $line
+                    }
+                }
             } finally {
                 [System.Threading.Monitor]::Exit($progress.SyncRoot)
             }
-
-            $statusColor = if ($subscriptionFailed) { 'Red' } elseif ($retrievedRecords -eq 0) { 'Yellow' } else { 'Green' }
-            $statusText  = if ($subscriptionFailed) { "FAILED" } else { "$retrievedRecords records (total: $totalRecords)" }
-            Write-Host ("[{0}/{1}] {2} - {3}" -f $position, $progress.Total, $subscriptionId, $statusText) -ForegroundColor $statusColor
 
             [pscustomobject]@{
                 SubscriptionId   = $subscriptionId
@@ -716,12 +828,27 @@ try {
         # Submit all jobs
         $jobs = foreach ($work in $workItems) {
             Start-ThreadJob -ThrottleLimit $ParallelWorkers `
+                -InitializationScript $initScript `
                 -ScriptBlock $workerScript `
-                -ArgumentList @($work, $argEndpoint, $accessToken, $kqlQuery, $secureScoreQuery, $totalRecordsQuery, $PageSize, $RunTempDirectory, $progressState)
+                -ArgumentList @($work, $sharedContext, $kqlQuery, $secureScoreQuery, $totalRecordsQuery, $PageSize, $RunTempDirectory, $progressState)
         }
 
-        # Wait, collect, clean up
-        $workerResults = @($jobs | Wait-Job | Receive-Job)
+        # Drain output live while jobs run.
+        # Wait-Job | Receive-Job buffers ALL output until every job completes,
+        # which makes the run look frozen. Polling Receive-Job every 250ms
+        # streams worker Write-Host output to the console as soon as workers
+        # emit it, while still capturing return values into $workerResults.
+        $workerResults = @()
+        $running = $true
+        while ($running) {
+            $workerResults += @($jobs | Receive-Job)
+            $running = [bool]($jobs | Where-Object { $_.State -in @('Running','NotStarted') })
+            if ($running) {
+                Start-Sleep -Milliseconds 250
+            }
+        }
+        # Final drain to capture anything emitted between the last poll and job completion.
+        $workerResults += @($jobs | Receive-Job)
         $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
 
         # Merge fragments in original subscription order
