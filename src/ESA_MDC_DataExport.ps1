@@ -675,10 +675,15 @@ try {
         # into $progressState.Buffer keyed by submission index. The main thread
         # drains the buffer in submission order so console output stays sorted
         # even though workers complete in parallel order.
+        # WorkerStatus carries a short live-progress label per in-flight sub
+        # (e.g. "page 3/14"); the main thread folds it into Write-Progress so
+        # the user sees forward motion across all workers, even while a heavy
+        # low-index sub is holding back the in-order text flush.
         $progressState = [hashtable]::Synchronized(@{
-            Completed = 0
-            Total     = $TotalSubscriptions
-            Buffer    = @{}   # int Index -> string[] (per-sub output lines)
+            Completed    = 0
+            Total        = $TotalSubscriptions
+            Buffer       = @{}   # int Index -> string[] (per-sub output lines)
+            WorkerStatus = @{}   # int Index -> string  (short live label)
         })
 
         # Auto-detect which ThreadJob module to import (Start-ThreadJob may be
@@ -852,6 +857,16 @@ try {
             $outputBuffer = New-Object 'System.Collections.Generic.List[string]'
             $outputBuffer.Add(("[{0}/{1}] Querying subscription: {2}" -f $subscriptionIndex, $progress.Total, $subscriptionId)) | Out-Null
 
+            # Tiny helper: update this sub's live status in the shared progress
+            # dict. Main thread reads this and renders it into Write-Progress.
+            $setStatus = {
+                param($label)
+                [System.Threading.Monitor]::Enter($progress.SyncRoot)
+                try { $progress.WorkerStatus[$subscriptionIndex] = $label }
+                finally { [System.Threading.Monitor]::Exit($progress.SyncRoot) }
+            }
+            & $setStatus 'secscore'
+
             # Secure score (best-effort). Track outcome so the end-of-run
             # summary can distinguish 'no securescores resource' from 'query
             # failed' - both leave $secureScore = $null otherwise.
@@ -867,15 +882,21 @@ try {
                 $secureScoreError = $_.Exception.Message
             }
 
+            & $setStatus 'count'
+
             # Total records (best-effort)
             $countResult = Invoke-WorkerSearchAzGraph -SubscriptionId $subscriptionId -Query $countQuery -First 1 -OperationName "Record count query" -OutputBuffer $outputBuffer
             if ($countResult.Succeeded -and $countResult.Result.Count -gt 0 -and $countResult.Result[0].totalRecords) {
                 $totalRecords = [int64]$countResult.Result[0].totalRecords
             }
+            $totalPages = if ($totalRecords -gt 0) { [int][Math]::Ceiling($totalRecords / [double]$pageSize) } else { 1 }
+            $currentPage = 0
 
             # Page through results
             $skip = 0
             while ($true) {
+                $currentPage++
+                & $setStatus ("page {0}/{1}" -f $currentPage, $totalPages)
                 $pageResult = Invoke-WorkerSearchAzGraph -SubscriptionId $subscriptionId -Query $kql -First $pageSize -Skip $skip -OperationName "Recommendation query" -OutputBuffer $outputBuffer
                 if (-not $pageResult.Succeeded) {
                     $outputBuffer.Add("Warning: Error executing query for subscription $subscriptionId") | Out-Null
@@ -914,6 +935,7 @@ try {
             try {
                 $progress.Buffer[$subscriptionIndex] = $outputBuffer.ToArray()
                 $progress.Completed++
+                [void]$progress.WorkerStatus.Remove($subscriptionIndex)
             } finally {
                 [System.Threading.Monitor]::Exit($progress.SyncRoot)
             }
@@ -984,15 +1006,30 @@ try {
                 [System.Threading.Monitor]::Exit($progressState.SyncRoot)
             }
 
-            # Update progress bar.
+            # Update progress bar. WorkerStatus is read under lock and folded
+            # into the status string so the user sees live per-worker page
+            # progress (e.g. "in-flight: #2(3/14), #3(5/12)") even while the
+            # in-order text flush is held back by a heavy low-index sub.
             $running   = @($jobs | Where-Object { $_.State -in @('Running','NotStarted') })
             $inFlight  = @($jobs | Where-Object { $_.State -eq 'Running' }).Count
             $buffered  = $progressState.Buffer.Count
             $done      = $progressState.Completed
             $waitingOn = if ($buffered -gt 0) { "; waiting on #$expectedNext" } else { "" }
             $pct       = if ($TotalSubscriptions -gt 0) { [int](($done / $TotalSubscriptions) * 100) } else { 0 }
+
+            $inFlightDetail = ""
+            [System.Threading.Monitor]::Enter($progressState.SyncRoot)
+            try {
+                if ($progressState.WorkerStatus.Count -gt 0) {
+                    $parts = foreach ($k in ($progressState.WorkerStatus.Keys | Sort-Object)) {
+                        "#$k($($progressState.WorkerStatus[$k]))"
+                    }
+                    $inFlightDetail = ": " + ($parts -join ', ')
+                }
+            } finally { [System.Threading.Monitor]::Exit($progressState.SyncRoot) }
+
             Write-Progress -Activity $progressActivity `
-                           -Status ("{0}/{1} done; {2} in-flight; {3} buffered{4}" -f $done, $TotalSubscriptions, $inFlight, $buffered, $waitingOn) `
+                           -Status ("{0}/{1} done; {2} in-flight{3}; {4} buffered{5}" -f $done, $TotalSubscriptions, $inFlight, $inFlightDetail, $buffered, $waitingOn) `
                            -PercentComplete $pct
 
             if ($running.Count -eq 0) { break }
@@ -1048,6 +1085,11 @@ try {
             $subscriptionFailed = $false
             $failureMessage   = $null
 
+            # Print the per-subscription header FIRST so the user sees activity
+            # immediately. The secure-score query below can take several seconds
+            # and previously made the console appear stuck between subs.
+            Write-Host ("[{0}/{1}] Querying subscription: {2}" -f $subscriptionIndex, $TotalSubscriptions, $SubscriptionId)
+
             # Secure score (best-effort). Track outcome so the end-of-run
             # summary can distinguish 'no securescores resource' from 'query
             # failed' - both leave $secureScore = $null otherwise.
@@ -1063,8 +1105,6 @@ try {
                 $secureScoreError = $_.Exception.Message
                 Write-Verbose "Secure score query failed for $SubscriptionId"
             }
-
-            Write-Host ("[{0}/{1}] Querying subscription: {2}" -f $subscriptionIndex, $TotalSubscriptions, $SubscriptionId)
 
             # Total records (best-effort)
             $countResult = Invoke-SearchAzGraphWithRetry -SubscriptionId $SubscriptionId -Query $totalRecordsQuery -First 1 -OperationName "Record count query"
