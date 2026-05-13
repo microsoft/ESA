@@ -440,8 +440,15 @@ function Invoke-SearchAzGraphWithRetry {
                 $response = Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -ErrorAction Stop
             }
             # Search-AzGraph (Az.ResourceGraph >= 0.10.0) returns a PSResourceGraphResponse<PSObject>
-            # wrapper, NOT an array of rows. Extract .Data so callers see actual record count.
-            $result = if ($response -and $null -ne $response.Data) { @($response.Data) } else { @() }
+            # wrapper with rows under .Data; older versions returned a flat PSObject[].
+            # Normalize so callers always see an array of rows.
+            $result = if ($null -eq $response) {
+                @()
+            } elseif ($response.PSObject.Properties.Name -contains 'Data') {
+                @($response.Data)
+            } else {
+                @($response)
+            }
             return [pscustomobject]@{
                 Succeeded    = $true
                 Result       = $result
@@ -704,8 +711,15 @@ try {
                             $response = Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -ErrorAction Stop
                         }
                         # Search-AzGraph (Az.ResourceGraph >= 0.10.0) returns a PSResourceGraphResponse<PSObject>
-                        # wrapper, NOT an array of rows. Extract .Data so callers see actual record count.
-                        $result = if ($response -and $null -ne $response.Data) { @($response.Data) } else { @() }
+                        # wrapper with rows under .Data; older versions returned a flat PSObject[].
+                        # Normalize so callers always see an array of rows.
+                        $result = if ($null -eq $response) {
+                            @()
+                        } elseif ($response.PSObject.Properties.Name -contains 'Data') {
+                            @($response.Data)
+                        } else {
+                            @($response)
+                        }
                         return [pscustomobject]@{
                             Succeeded    = $true
                             Result       = $result
