@@ -439,7 +439,7 @@ function Invoke-SearchAzGraphWithRetry {
             } else {
                 $response = Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -ErrorAction Stop
             }
-            # Search-AzGraph (Az.ResourceGraph 1.x) returns a PSResourceGraphResponse<PSObject>
+            # Search-AzGraph (Az.ResourceGraph >= 0.10.0) returns a PSResourceGraphResponse<PSObject>
             # wrapper, NOT an array of rows. Extract .Data so callers see actual record count.
             $result = if ($response -and $null -ne $response.Data) { @($response.Data) } else { @() }
             return [pscustomobject]@{
@@ -703,7 +703,7 @@ try {
                         } else {
                             $response = Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -ErrorAction Stop
                         }
-                        # Search-AzGraph (Az.ResourceGraph 1.x) returns a PSResourceGraphResponse<PSObject>
+                        # Search-AzGraph (Az.ResourceGraph >= 0.10.0) returns a PSResourceGraphResponse<PSObject>
                         # wrapper, NOT an array of rows. Extract .Data so callers see actual record count.
                         $result = if ($response -and $null -ne $response.Data) { @($response.Data) } else { @() }
                         return [pscustomobject]@{
