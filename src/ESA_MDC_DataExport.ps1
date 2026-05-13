@@ -86,6 +86,28 @@ if (-Not $parameters.CSVFileName) {
     exit 1
 }
 
+# Parse ParallelWorkers (default 1 = serial, opt-in parallelism via JSON)
+$ParallelWorkers = 1
+if ($null -ne $parameters.ParallelWorkers) {
+    $parsedWorkers = 0
+    if (-not [int]::TryParse([string]$parameters.ParallelWorkers, [ref]$parsedWorkers)) {
+        Write-Host "Error: ParallelWorkers must be an integer between 1 and 50." -ForegroundColor Red
+        exit 1
+    }
+    $ParallelWorkers = $parsedWorkers
+}
+if ($ParallelWorkers -lt 1 -or $ParallelWorkers -gt 50) {
+    Write-Host "Error: ParallelWorkers must be between 1 and 50 (got: $ParallelWorkers)." -ForegroundColor Red
+    exit 1
+}
+if ($ParallelWorkers -gt 1) {
+    if (-not (Get-Module -ListAvailable -Name ThreadJob)) {
+        Write-Host "Error: ParallelWorkers > 1 requires the 'ThreadJob' module." -ForegroundColor Red
+        Write-Host "  Install with: Install-Module ThreadJob -Scope CurrentUser" -ForegroundColor Green
+        exit 1
+    }
+}
+
 # Read the KQL Query
 $kqlQuery = Get-Content -Path $parameters.QueryFile -Raw -Encoding UTF8
 
@@ -251,139 +273,557 @@ if ($incompleteFiles) {
     $incompleteFiles | ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
 }
 
-# Loop through each Subscription ID
-try {
-    foreach ($SubscriptionId in $SubscriptionIds) {
-        
-        # Query Secure Score for the subscription
-        $secureScoreQuery = @'
-        securityresources
-        | where type == "microsoft.security/securescores"
-        | where properties.environment == "Azure"
-        | extend subscriptionSecureScore = round(100 * bin((todouble(properties.score.current))/ todouble(properties.score.max), 0.001))
-        | where subscriptionSecureScore > 0
-        | project subscriptionSecureScore, subscriptionId
-'@
+# ============================================================================
+# Helper functions (used by the serial path; the parallel worker contains
+# functionally equivalent inline copies because ThreadJobs run in isolated
+# runspaces. Keep the two implementations in sync.)
+# ============================================================================
+
+function Get-ResourceGraphErrorCode {
+    param([Parameter(Mandatory)] $ErrorRecord)
+
+    $rawContent = $null
+    if ($ErrorRecord.Exception -and $ErrorRecord.Exception.PSObject.Properties['Response'] `
+        -and $ErrorRecord.Exception.Response -and $ErrorRecord.Exception.Response.PSObject.Properties['Content']) {
+        $rawContent = $ErrorRecord.Exception.Response.Content
+    }
+    if (-not $rawContent) { return "Unknown" }
+
+    try {
+        $details = $rawContent | ConvertFrom-Json -ErrorAction Stop
+        if ($details -and $details.error -and $details.error.code) {
+            return [string]$details.error.code
+        }
+    } catch {
+        Write-Debug "Get-ResourceGraphErrorCode: failed to parse error body as JSON; returning 'Unknown'."
+    }
+    return "Unknown"
+}
+
+function Test-IsRetriableResourceGraphError {
+    param(
+        [Parameter(Mandatory)] $ErrorRecord,
+        [string] $ErrorCode = "Unknown"
+    )
+
+    if ($ErrorCode -in @("GatewayTimeout", "InternalServerError", "ServiceUnavailable", "RateLimiting", "TooManyRequests")) {
+        return $true
+    }
+
+    $errorText = $ErrorRecord | Out-String
+    if ($errorText -match "RateLimiting|TooManyRequests|throttled") { return $true }
+
+    $exception = $ErrorRecord.Exception
+    while ($exception) {
+        if ($exception -is [System.TimeoutException] -or
+            $exception -is [System.Threading.Tasks.TaskCanceledException] -or
+            $exception -is [System.OperationCanceledException] -or
+            $exception -is [System.Net.Http.HttpRequestException] -or
+            $exception -is [System.IO.IOException]) {
+            return $true
+        }
+        $exception = $exception.InnerException
+    }
+
+    return ($errorText -match "task was canceled|timed out|connection reset by peer|ssl connection could not be established|error while copying content to a stream")
+}
+
+function Invoke-SearchAzGraphWithRetry {
+    param(
+        [Parameter(Mandatory)] [string] $SubscriptionId,
+        [Parameter(Mandatory)] [string] $Query,
+        [Parameter(Mandatory)] [int]    $First,
+        [int]    $Skip = 0,
+        [string] $OperationName = "Resource Graph query",
+        [int]    $MaxRetries = 3,
+        [int]    $RetryDelaySeconds = 2,
+        [int]    $RateLimitMaxRetries = 10,
+        [int]    $RateLimitRetryDelaySeconds = 5
+    )
+
+    $retryCount = 0
+    while ($true) {
         try {
-            $secureScoreResult = Search-AzGraph -Query $secureScoreQuery -Subscription $SubscriptionId -First 1 -ErrorAction Stop
-            if ($secureScoreResult -and $secureScoreResult.subscriptionSecureScore) {
-                $secureScoresList += $secureScoreResult.subscriptionSecureScore  # Store only valid values
+            if ($Skip -gt 0) {
+                $result = @(Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -Skip $Skip -ErrorAction Stop)
+            } else {
+                $result = @(Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -ErrorAction Stop)
+            }
+            return [pscustomobject]@{
+                Succeeded    = $true
+                Result       = $result
+                ErrorMessage = $null
+                ErrorCode    = $null
             }
         } catch {
-            # Continue silently on errors (no logging, just skip)
+            $errorRecord  = $_
+            $errorMessage = $errorRecord | Format-List -Force | Out-String
+            $errorCode    = Get-ResourceGraphErrorCode -ErrorRecord $errorRecord
+            $isRetriable  = Test-IsRetriableResourceGraphError -ErrorRecord $errorRecord -ErrorCode $errorCode
+            $isRateLimited = ($errorCode -in @("RateLimiting", "TooManyRequests")) -or
+                             (($errorRecord | Out-String) -match "RateLimiting|TooManyRequests|throttled")
+            $retryLimit   = if ($isRateLimited) { $RateLimitMaxRetries } else { $MaxRetries }
+
+            if (-not $isRetriable -or $retryCount -ge $retryLimit) {
+                return [pscustomobject]@{
+                    Succeeded    = $false
+                    Result       = @()
+                    ErrorMessage = $errorMessage
+                    ErrorCode    = $errorCode
+                }
+            }
+
+            $retryCount++
+            $backoffDelay = if ($isRateLimited) {
+                $RateLimitRetryDelaySeconds * $retryCount
+            } else {
+                [math]::Pow(2, $retryCount) * $RetryDelaySeconds
+            }
+            $reason = if ([string]::IsNullOrWhiteSpace($errorCode)) { "Unknown" } else { $errorCode }
+            Write-Host "Warning: $OperationName for subscription $SubscriptionId hit $reason. Retrying in $backoffDelay seconds... (Attempt $retryCount of $retryLimit)" -ForegroundColor Yellow
+            Start-Sleep -Seconds $backoffDelay
         }
+    }
+}
 
-        $SubscriptionCount++
-        Write-Host "Querying subscription ($SubscriptionCount/$($SubscriptionIds.Count)): $SubscriptionId"
-        $Skip = 0
+function Merge-CsvFile {
+    param(
+        [string[]] $SourceFiles,
+        [string]   $DestinationFile
+    )
 
-        # Retrieve Total Record Count Before Querying
-        $totalRecordsQuery = "$kqlQuery | summarize totalRecords = count()"
-        try {
-            $totalRecordsResult = Search-AzGraph -Query $totalRecordsQuery -Subscription $SubscriptionId -First 1 -ErrorAction Stop 
-            $totalRecords = if ($totalRecordsResult.totalRecords) { $totalRecordsResult.totalRecords } else { 0 }
-        } catch {
-            $totalRecords = 0
+    $existing = @($SourceFiles | Where-Object { $_ -and (Test-Path $_) })
+    if ($existing.Count -eq 0) { return $false }
+
+    $utf8   = [System.Text.UTF8Encoding]::new($false)
+    $writer = [System.IO.StreamWriter]::new($DestinationFile, $false, $utf8)
+    try {
+        $first = $true
+        foreach ($file in $existing) {
+            $reader = [System.IO.StreamReader]::new($file)
+            try {
+                if (-not $first -and -not $reader.EndOfStream) {
+                    [void]$reader.ReadLine()  # skip header on subsequent fragments
+                }
+                while (-not $reader.EndOfStream) {
+                    $writer.WriteLine($reader.ReadLine())
+                }
+                $first = $false
+            } finally { $reader.Dispose() }
         }
+    } finally { $writer.Dispose() }
+    return $true
+}
 
-        $retrievedRecords = 0
+function Merge-TextFile {
+    param(
+        [string[]] $SourceFiles,
+        [string]   $DestinationFile
+    )
 
-        # Execute the query with retry and exponential backoff
-        $maxRetries = 3
-        $retryDelay = 2  # Initial delay in seconds (the total wait time is 28 seconds if all (3) retries are exhausted)
-        while ($true) {
-            $retryCount = 0
-            while ($retryCount -le $maxRetries) {
-                try {
-                    if ($Skip -eq 0) {
-                        $queryResults = Search-AzGraph -Query $kqlQuery -Subscription $SubscriptionId -First $PageSize -ErrorAction Stop
-                    } else {
-                        $queryResults = Search-AzGraph -Query $kqlQuery -Subscription $SubscriptionId -First $PageSize -Skip $Skip -ErrorAction Stop
-                    }
-            
-                    if (-not $queryResults) {
-                        Write-Host "No records retrieved for subscription $SubscriptionId." -ForegroundColor Yellow
-                        break
-                    }
-                    break # If query is successful, break out of the retry loop
-                } catch {
-                    # Extract and parse the error details 
-                    $errorMessage = $Error[0] | Format-List -Force | Out-String
-                    $rawContent = $Error[0].Exception.Response.Content
-                
-                    if ($rawContent) {
+    $existing = @($SourceFiles | Where-Object { $_ -and (Test-Path $_) })
+    if ($existing.Count -eq 0) { return $false }
+
+    $utf8   = [System.Text.UTF8Encoding]::new($false)
+    $writer = [System.IO.StreamWriter]::new($DestinationFile, $false, $utf8)
+    try {
+        foreach ($file in $existing) {
+            $reader = [System.IO.StreamReader]::new($file)
+            try {
+                while (-not $reader.EndOfStream) {
+                    $writer.WriteLine($reader.ReadLine())
+                }
+            } finally { $reader.Dispose() }
+        }
+    } finally { $writer.Dispose() }
+    return $true
+}
+
+function Get-FormattedFileSize {
+    param([long] $Bytes)
+
+    if ($Bytes -lt 1KB) { return ("{0:N0} Bytes" -f $Bytes) }
+    if ($Bytes -lt 1MB) { return ("{0:N2} KB"    -f ($Bytes / 1KB)) }
+    if ($Bytes -lt 1GB) { return ("{0:N2} MB"    -f ($Bytes / 1MB)) }
+    return ("{0:N2} GB" -f ($Bytes / 1GB))
+}
+
+# ============================================================================
+# Shared queries and work items
+# ============================================================================
+
+$secureScoreQuery = @'
+securityresources
+| where type == "microsoft.security/securescores"
+| where properties.environment == "Azure"
+| extend subscriptionSecureScore = round(100 * bin((todouble(properties.score.current))/ todouble(properties.score.max), 0.001))
+| where subscriptionSecureScore > 0
+| project subscriptionSecureScore, subscriptionId
+'@
+$totalRecordsQuery = "$kqlQuery | summarize totalRecords = count()"
+
+$workItems = for ($i = 0; $i -lt $SubscriptionIds.Count; $i++) {
+    [pscustomobject]@{
+        Index          = $i + 1
+        SubscriptionId = $SubscriptionIds[$i]
+    }
+}
+$TotalSubscriptions = $workItems.Count
+$workerResults     = @()
+$RunTempDirectory  = $null
+$cleanupRunTempDirectory = $false
+
+# ============================================================================
+# Main execution: serial path (default) or parallel path (opt-in)
+# ============================================================================
+try {
+    if ($ParallelWorkers -gt 1) {
+        # ------------------------------------------------------------
+        # Parallel execution path (ThreadJob + ARG REST API)
+        # ------------------------------------------------------------
+
+        $RunTempDirectory = Join-Path -Path (Get-Location).Path -ChildPath "$BaseFileName`_$Timestamp.parts"
+        New-Item -ItemType Directory -Path $RunTempDirectory -Force | Out-Null
+
+        # Derive ARM endpoint from current Az environment (works for AzureCloud + AzureUSGovernment)
+        $azContextNow      = Get-AzContext
+        $resourceManagerUrl = $azContextNow.Environment.ResourceManagerUrl.TrimEnd('/')
+        $argEndpoint       = "$resourceManagerUrl/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01"
+
+        # Bearer token (env-aware via the current Az context). Captured once.
+        # The token is held only in process memory and passed by argument to workers.
+        $accessToken = (Get-AzAccessToken -ResourceUrl ($resourceManagerUrl + '/') -TenantId $tenantId -ErrorAction Stop).Token
+
+        # Synchronized progress counter so output is monotonic across workers.
+        $progressState = [hashtable]::Synchronized(@{
+            Completed = 0
+            Total     = $TotalSubscriptions
+        })
+
+        Import-Module ThreadJob -ErrorAction Stop | Out-Null
+
+        Write-Host "Starting parallel export with $ParallelWorkers workers across $TotalSubscriptions subscriptions..." -ForegroundColor Cyan
+        Write-Host "Note: the bearer token captured at start expires in ~60 minutes. For larger tenants, prefer ParallelWorkers=1 (serial) which auto-refreshes via the Az SDK." -ForegroundColor DarkGray
+
+        $workerScript = {
+            param(
+                $work, $endpoint, $token, $kql, $ssQuery, $countQuery,
+                $pageSize, $runTempDir, $progress
+            )
+
+            $subscriptionId    = $work.SubscriptionId
+            $subscriptionIndex = $work.Index
+            $csvFragment       = Join-Path $runTempDir ("{0:D6}_{1}.csv"    -f $subscriptionIndex, $subscriptionId)
+            $failedFragment    = Join-Path $runTempDir ("{0:D6}_{1}.failed" -f $subscriptionIndex, $subscriptionId)
+            $secureScore        = $null
+            $retrievedRecords   = 0
+            $totalRecords       = 0
+            $subscriptionFailed = $false
+            $failureMessage     = $null
+
+            # ---- Inline ARG REST query with retry (mirrors Invoke-SearchAzGraphWithRetry) ----
+            function Invoke-ArgRestWithRetry {
+                param(
+                    [string] $SubscriptionId,
+                    [string] $Query,
+                    [int]    $First,
+                    [int]    $Skip,
+                    [string] $OperationName,
+                    [string] $Endpoint,
+                    [string] $Token
+                )
+
+                $maxRetries                 = 3
+                $retryDelaySeconds          = 2
+                $rateLimitMaxRetries        = 10
+                $rateLimitRetryDelaySeconds = 5
+                $retryCount                 = 0
+
+                $headers = @{
+                    Authorization  = "Bearer $Token"
+                    'Content-Type' = 'application/json'
+                }
+
+                while ($true) {
+                    try {
+                        $body = @{
+                            subscriptions = @($SubscriptionId)
+                            query         = $Query
+                            options       = @{
+                                '$top'       = $First
+                                '$skip'      = $Skip
+                                resultFormat = 'objectArray'
+                            }
+                        } | ConvertTo-Json -Depth 5 -Compress
+
+                        $response = Invoke-RestMethod -Method Post -Uri $Endpoint -Headers $headers -Body $body -ErrorAction Stop
+
+                        $rows = @()
+                        if ($null -ne $response.data) {
+                            $rows = @($response.data)
+                        }
+
+                        return [pscustomobject]@{
+                            Succeeded    = $true
+                            Result       = $rows
+                            ErrorMessage = $null
+                            ErrorCode    = $null
+                        }
+                    } catch {
+                        $errorRecord  = $_
+                        $errorMessage = $errorRecord | Format-List -Force | Out-String
+                        $errorCode    = "Unknown"
+
+                        # Try to parse error code from REST response body
                         try {
-                            $errorDetails = $rawContent | ConvertFrom-Json 
-                            if ($errorDetails -and $errorDetails.error -and $errorDetails.error.code) {
-                                $errorCode = $errorDetails.error.code
-                            } else {
-                                $errorCode = "Unknown"
+                            $errResponse = $errorRecord.Exception.Response
+                            $body = $null
+                            if ($errResponse) {
+                                if ($errResponse -is [System.Net.Http.HttpResponseMessage]) {
+                                    $body = $errResponse.Content.ReadAsStringAsync().Result
+                                } elseif ($errResponse.GetResponseStream) {
+                                    $stream = $errResponse.GetResponseStream()
+                                    $reader = [System.IO.StreamReader]::new($stream)
+                                    $body = $reader.ReadToEnd()
+                                    $reader.Dispose()
+                                }
+                            }
+                            if (-not $body -and $errorRecord.ErrorDetails) {
+                                $body = $errorRecord.ErrorDetails.Message
+                            }
+                            if ($body) {
+                                $details = $body | ConvertFrom-Json -ErrorAction Stop
+                                if ($details -and $details.error -and $details.error.code) {
+                                    $errorCode = [string]$details.error.code
+                                }
                             }
                         } catch {
-                            $errorCode = "Unknown"
+                            Write-Debug "Invoke-ArgRestWithRetry: failed to parse error body as JSON; errorCode left as 'Unknown'."
                         }
-                    } else {
-                        $errorCode = "Unknown"
-                    }
-                
-                    # Check if the error is GatewayTimeout or InternalServerError
-                    if ($errorCode -eq "GatewayTimeout" -or $errorCode -eq "InternalServerError") {
-                        # Increment retry count
+
+                        $errorText  = $errorRecord | Out-String
+                        $isRetriable = ($errorCode -in @("GatewayTimeout", "InternalServerError", "ServiceUnavailable", "RateLimiting", "TooManyRequests")) -or
+                                       ($errorText -match "RateLimiting|TooManyRequests|throttled|task was canceled|timed out|connection reset by peer|ssl connection could not be established|error while copying content to a stream")
+                        if (-not $isRetriable) {
+                            $exception = $errorRecord.Exception
+                            while ($exception) {
+                                if ($exception -is [System.TimeoutException] -or
+                                    $exception -is [System.Threading.Tasks.TaskCanceledException] -or
+                                    $exception -is [System.OperationCanceledException] -or
+                                    $exception -is [System.Net.Http.HttpRequestException] -or
+                                    $exception -is [System.IO.IOException]) {
+                                    $isRetriable = $true
+                                    break
+                                }
+                                $exception = $exception.InnerException
+                            }
+                        }
+
+                        $isRateLimited = ($errorCode -in @("RateLimiting", "TooManyRequests")) -or
+                                         ($errorText -match "RateLimiting|TooManyRequests|throttled")
+                        $retryLimit = if ($isRateLimited) { $rateLimitMaxRetries } else { $maxRetries }
+
+                        if (-not $isRetriable -or $retryCount -ge $retryLimit) {
+                            return [pscustomobject]@{
+                                Succeeded    = $false
+                                Result       = @()
+                                ErrorMessage = $errorMessage
+                                ErrorCode    = $errorCode
+                            }
+                        }
+
                         $retryCount++
-                        
-                        # If max retries reached, log the error and break the loop
-                        if ($retryCount -gt $maxRetries) {
-                            Write-Host "Warning: Error executing query for subscription $SubscriptionId" -ForegroundColor Yellow
-                            Add-Content -Path $FailedSubscriptionsFile -Value "Subscription ID: $SubscriptionId - Error: $errorMessage"
-                            break  # Skip further processing for this subscription and move to the next one
+                        $backoffDelay = if ($isRateLimited) {
+                            $rateLimitRetryDelaySeconds * $retryCount
+                        } else {
+                            [math]::Pow(2, $retryCount) * $retryDelaySeconds
                         }
-                
-                        $backoffDelay = [math]::Pow(2, $retryCount) * $retryDelay # Exponential backoff delay 
-                        Write-Host "Warning: Error executing query for subscription $SubscriptionId. Retrying in $backoffDelay seconds... (Attempt $retryCount of $maxRetries)" -ForegroundColor Yellow
+                        $reason = if ([string]::IsNullOrWhiteSpace($errorCode)) { "Unknown" } else { $errorCode }
+                        Write-Host "Warning: $OperationName for subscription $SubscriptionId hit $reason. Retrying in $backoffDelay seconds... (Attempt $retryCount of $retryLimit)" -ForegroundColor Yellow
                         Start-Sleep -Seconds $backoffDelay
-                    } else {
-                        # For other errors, log and break the loop (no retry)
-                        Write-Host "Warning: Error executing query for subscription $SubscriptionId" -ForegroundColor Yellow
-                        Add-Content -Path $FailedSubscriptionsFile -Value "Subscription ID: $SubscriptionId - Error: $errorMessage"
-                        break  # Skip further processing for this subscription and move to the next one
                     }
                 }
-                
             }
 
-            # Ensure datetime fields are correctly formatted
-            if ($queryResults) {
-                $queryResults | ForEach-Object {
-                    $_.PSObject.Properties | Where-Object { $_.Value -is [datetime] } | ForEach-Object { $_.Value = $_.Value.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") }
+            # Secure score (best-effort)
+            try {
+                $ssResult = Invoke-ArgRestWithRetry -SubscriptionId $subscriptionId -Query $ssQuery -First 1 -Skip 0 -OperationName "Secure score query" -Endpoint $endpoint -Token $token
+                if ($ssResult.Succeeded -and $ssResult.Result.Count -gt 0 -and $ssResult.Result[0].subscriptionSecureScore) {
+                    $secureScore = [double]$ssResult.Result[0].subscriptionSecureScore
+                }
+            } catch {
+                Write-Verbose "Secure score query failed for $subscriptionId"
+            }
+
+            # Total records (best-effort)
+            $countResult = Invoke-ArgRestWithRetry -SubscriptionId $subscriptionId -Query $countQuery -First 1 -Skip 0 -OperationName "Record count query" -Endpoint $endpoint -Token $token
+            if ($countResult.Succeeded -and $countResult.Result.Count -gt 0 -and $countResult.Result[0].totalRecords) {
+                $totalRecords = [int64]$countResult.Result[0].totalRecords
+            }
+
+            # Page through results
+            $skip = 0
+            while ($true) {
+                $pageResult = Invoke-ArgRestWithRetry -SubscriptionId $subscriptionId -Query $kql -First $pageSize -Skip $skip -OperationName "Recommendation query" -Endpoint $endpoint -Token $token
+                if (-not $pageResult.Succeeded) {
+                    Add-Content -Path $failedFragment -Value "Subscription ID: $subscriptionId - Error: $($pageResult.ErrorMessage)" -Encoding UTF8
+                    $subscriptionFailed = $true
+                    $failureMessage = $pageResult.ErrorMessage
+                    break
+                }
+
+                $batch = $pageResult.Result
+                $batchCount = $batch.Count
+                if ($batchCount -eq 0) { break }
+
+                $batch | ForEach-Object {
+                    $_.PSObject.Properties | Where-Object { $_.Value -is [datetime] } | ForEach-Object {
+                        $_.Value = $_.Value.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                    }
+                    $_
+                } | Export-Csv -Path $csvFragment -NoTypeInformation -Append
+
+                $retrievedRecords += $batchCount
+                $skip += $pageSize
+                if ($batchCount -lt $pageSize) { break }
+            }
+
+            # Increment ordered progress counter and emit a single status line
+            [System.Threading.Monitor]::Enter($progress.SyncRoot)
+            try {
+                $progress.Completed++
+                $position = $progress.Completed
+            } finally {
+                [System.Threading.Monitor]::Exit($progress.SyncRoot)
+            }
+
+            $statusColor = if ($subscriptionFailed) { 'Red' } elseif ($retrievedRecords -eq 0) { 'Yellow' } else { 'Green' }
+            $statusText  = if ($subscriptionFailed) { "FAILED" } else { "$retrievedRecords records (total: $totalRecords)" }
+            Write-Host ("[{0}/{1}] {2} - {3}" -f $position, $progress.Total, $subscriptionId, $statusText) -ForegroundColor $statusColor
+
+            [pscustomobject]@{
+                SubscriptionId   = $subscriptionId
+                Index            = $subscriptionIndex
+                SecureScore      = $secureScore
+                RetrievedRecords = $retrievedRecords
+                Failed           = $subscriptionFailed
+                FailureMessage   = $failureMessage
+                CsvPath          = if (Test-Path $csvFragment) { $csvFragment } else { $null }
+                FailedPath       = if (Test-Path $failedFragment) { $failedFragment } else { $null }
+            }
+        }
+
+        # Submit all jobs
+        $jobs = foreach ($work in $workItems) {
+            Start-ThreadJob -ThrottleLimit $ParallelWorkers `
+                -ScriptBlock $workerScript `
+                -ArgumentList @($work, $argEndpoint, $accessToken, $kqlQuery, $secureScoreQuery, $totalRecordsQuery, $PageSize, $RunTempDirectory, $progressState)
+        }
+
+        # Wait, collect, clean up
+        $workerResults = @($jobs | Wait-Job | Receive-Job)
+        $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
+
+        # Merge fragments in original subscription order
+        $orderedResults = @($workerResults | Sort-Object Index)
+        $csvFragments    = @($orderedResults | Where-Object { $_.CsvPath }    | Select-Object -ExpandProperty CsvPath)
+        $failedFragments = @($orderedResults | Where-Object { $_.FailedPath } | Select-Object -ExpandProperty FailedPath)
+
+        if ($csvFragments.Count -gt 0) {
+            Merge-CsvFile -SourceFiles $csvFragments -DestinationFile $TempOutputFile | Out-Null
+        }
+        if ($failedFragments.Count -gt 0) {
+            Merge-TextFile -SourceFiles $failedFragments -DestinationFile $FailedSubscriptionsFile | Out-Null
+        }
+
+        $cleanupRunTempDirectory = $true
+
+    } else {
+        # ------------------------------------------------------------
+        # Serial execution path (default; PS5.1-compatible; uses Search-AzGraph)
+        # ------------------------------------------------------------
+
+        $workerResults = foreach ($work in $workItems) {
+            $SubscriptionId   = $work.SubscriptionId
+            $subscriptionIndex = $work.Index
+            $secureScore      = $null
+            $retrievedRecords = 0
+            $totalRecords     = 0
+            $subscriptionFailed = $false
+            $failureMessage   = $null
+
+            # Secure score (best-effort)
+            try {
+                $ssResult = Invoke-SearchAzGraphWithRetry -SubscriptionId $SubscriptionId -Query $secureScoreQuery -First 1 -OperationName "Secure score query"
+                if ($ssResult.Succeeded -and $ssResult.Result.Count -gt 0 -and $ssResult.Result[0].subscriptionSecureScore) {
+                    $secureScore = [double]$ssResult.Result[0].subscriptionSecureScore
+                }
+            } catch {
+                Write-Verbose "Secure score query failed for $SubscriptionId"
+            }
+
+            Write-Host ("[{0}/{1}] Querying subscription: {2}" -f $subscriptionIndex, $TotalSubscriptions, $SubscriptionId)
+
+            # Total records (best-effort)
+            $countResult = Invoke-SearchAzGraphWithRetry -SubscriptionId $SubscriptionId -Query $totalRecordsQuery -First 1 -OperationName "Record count query"
+            if ($countResult.Succeeded -and $countResult.Result.Count -gt 0 -and $countResult.Result[0].totalRecords) {
+                $totalRecords = [int64]$countResult.Result[0].totalRecords
+            }
+
+            # Page through results
+            $Skip = 0
+            while ($true) {
+                $pageResult = Invoke-SearchAzGraphWithRetry -SubscriptionId $SubscriptionId -Query $kqlQuery -First $PageSize -Skip $Skip -OperationName "Recommendation query"
+                if (-not $pageResult.Succeeded) {
+                    Write-Host "Warning: Error executing query for subscription $SubscriptionId" -ForegroundColor Yellow
+                    Add-Content -Path $FailedSubscriptionsFile -Value "Subscription ID: $SubscriptionId - Error: $($pageResult.ErrorMessage)"
+                    $subscriptionFailed = $true
+                    $failureMessage = $pageResult.ErrorMessage
+                    break
+                }
+
+                $batch = $pageResult.Result
+                $batchCount = $batch.Count
+                if ($batchCount -eq 0) {
+                    Write-Host "Subscription $SubscriptionId - Retrieved 0 records" -ForegroundColor Yellow
+                    break
+                }
+
+                $batch | ForEach-Object {
+                    $_.PSObject.Properties | Where-Object { $_.Value -is [datetime] } | ForEach-Object {
+                        $_.Value = $_.Value.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                    }
                     $_
                 } | Export-Csv -Path $TempOutputFile -NoTypeInformation -Append
 
-                $retrievedRecords += $queryResults.Count
+                $retrievedRecords += $batchCount
                 $Skip += $PageSize
+                $remainingRecords = [Math]::Max(0, $totalRecords - $retrievedRecords)
+                Write-Host "Subscription $SubscriptionId - Retrieved $batchCount records, remaining: $remainingRecords" -ForegroundColor Green
+
+                if ($batchCount -lt $PageSize) { break }
             }
 
-            $remainingRecords = $totalRecords - $retrievedRecords
-            
-            # Display Progress with Remaining Records
-            if ($remainingRecords -lt 0) { $remainingRecords = 0 }
-            if ($queryResults.Count -eq 0) {
-                Write-Host "Subscription $SubscriptionId - Retrieved 0 records" -ForegroundColor Yellow
-            } else {
-                Write-Host "Subscription $SubscriptionId - Retrieved $($queryResults.Count) records, remaining: $(if ($remainingRecords -lt 0) { 'not available' } else { $remainingRecords })" -ForegroundColor Green
+            [pscustomobject]@{
+                SubscriptionId   = $SubscriptionId
+                Index            = $subscriptionIndex
+                SecureScore      = $secureScore
+                RetrievedRecords = $retrievedRecords
+                Failed           = $subscriptionFailed
+                FailureMessage   = $failureMessage
             }
-            
-            if ($queryResults.Count -lt $PageSize) {
-                break
-            }
-
-            # Explicitly release the reference to allow memory cleanup in large data processing
-            $queryResults = $null
-
         }
+        $workerResults = @($workerResults)
     }
 
+    # ------------------------------------------------------------
+    # Common: aggregate results, finalize files
+    # ------------------------------------------------------------
+
+    $SubscriptionCount = $workerResults.Count
+    $secureScoresList  = @($workerResults | Where-Object { $null -ne $_.SecureScore } | Select-Object -ExpandProperty SecureScore)
+
     Write-Host ""
-    # Calculate Overall Secure Score across all subscriptions
     if ($secureScoresList.Count -gt 0) {
         $overallSecureScore = [math]::Round(($secureScoresList | Measure-Object -Average).Average, 2)
         Write-Host ("Overall Secure Score across {0} subscriptions: {1}" -f $secureScoresList.Count, $overallSecureScore) -ForegroundColor Green
@@ -392,31 +832,28 @@ try {
     }
     Write-Host ""
 
-
     if (Test-Path $TempOutputFile) {
-        # Rename the temporary file to the final output file
-        Rename-Item -Path $TempOutputFile -NewName $FinalOutputFile
+        Move-Item -Path $TempOutputFile -Destination $FinalOutputFile -Force
 
-        # Get file size in a readable format
-        $fileSizeBytes = (Get-Item $FinalOutputFile).Length
-        $sizeUnits = @("KB", "MB", "GB")
-        $sizeThresholds = @(1KB, 1MB, 1GB)
-        $index = ($sizeThresholds | Where-Object { $fileSizeBytes -ge $_ } | Measure-Object).Count - 1
-        $fileSizeFormatted = "{0:N2} {1}" -f ($fileSizeBytes / $sizeThresholds[$index]), $sizeUnits[$index]
+        $fileSizeBytes     = (Get-Item $FinalOutputFile).Length
+        $fileSizeFormatted = Get-FormattedFileSize -Bytes $fileSizeBytes
 
         Write-Host "Data export completed: $FinalOutputFile ($fileSizeFormatted)" -ForegroundColor Green
-
     } else {
         Write-Host "Warning: No data was exported." -ForegroundColor Red
     }
 
     if (Test-Path $FailedSubscriptionsFile) {
-            Write-Host "Some subscriptions failed. See log file: $FailedSubscriptionsFile" -ForegroundColor Yellow
+        Write-Host "Some subscriptions failed. See log file: $FailedSubscriptionsFile" -ForegroundColor Yellow
     }
 } catch {
     $errorMessage = $Error[0] | Format-List -Force | Out-String
     Write-Host "Error encountered during execution: $errorMessage" -ForegroundColor Red
     exit 1
+} finally {
+    if ($cleanupRunTempDirectory -and $RunTempDirectory -and (Test-Path $RunTempDirectory)) {
+        Remove-Item -Path $RunTempDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 $EndTime = Get-Date

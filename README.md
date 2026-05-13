@@ -49,7 +49,9 @@ If you run the script without any parameters, a help message will be displayed.
 
 To export both MDC and MCSB data, run the script twice - once with each parameter file.
 
-**Retry Logic:** The script uses *exponential backoff* retry logic to handle transient errors, retrying failed calls with delays of up to 28 seconds. Status messages are shown during retries.
+**Retry Logic:** The script retries transient Azure Resource Graph failures automatically. General transient failures (`GatewayTimeout`, `InternalServerError`, `ServiceUnavailable`, network errors, TLS resets) use *exponential backoff* with up to 3 retries (delays of 4 / 8 / 16 seconds). Resource Graph throttling (`RateLimiting`, `TooManyRequests`) uses a more patient *linear* policy with up to 10 retries (delays of 5, 10, 15, … seconds) before a subscription is marked as failed. Status messages are shown during retries.
+
+**Parallel Execution (opt-in):** By default the script processes subscriptions one at a time. To speed up large tenants, set `"ParallelWorkers": N` (2–50) in the JSON parameter file. The parallel path requires the `ThreadJob` module (`Install-Module ThreadJob -Scope CurrentUser`) and uses an in-memory bearer token (never written to disk). Each worker writes its own temporary CSV fragment; the script merges them into the final CSV in original subscription order after all workers finish. Note: the captured token is valid for ~60 minutes; for very long runs prefer `ParallelWorkers: 1` (the serial path uses the Az SDK and auto-refreshes the token).
 
 **Error Logging:** If any errors occur during the execution of the KQL query, they will be logged in a file with the `.failed` extension.
 
@@ -88,10 +90,12 @@ This JSON file defines input parameters for the `ESA_MDC_DataExport.ps1` script 
   "CSVFileName": "Export_MDC_Recommendations.csv",
   "QueryFile": "MDC.kql",
   "SubscriptionIds": ["*"],
+  "ParallelWorkers": 1,
   "_comments": {
     "CSVFileName": "Final CSV output file for Power BI import",
     "QueryFile": "KQL Query file. Do not change!",
-    "SubscriptionIds": "Comma-separated subscription IDs or '*' for all available subscriptions. If you specify specific subscriptions, ensure you connect to the correct tenant (if you have access to multiple tenants) during script execution. If you don't have access to some subscriptions, the script will continue with the remaining ones."
+    "SubscriptionIds": "Comma-separated subscription IDs or '*' for all available subscriptions. If you specify specific subscriptions, ensure you connect to the correct tenant (if you have access to multiple tenants) during script execution. If you don't have access to some subscriptions, the script will continue with the remaining ones.",
+    "ParallelWorkers": "Default 1 (serial). Set to 2-50 to query subscriptions in parallel."
   }
 }
 ```
@@ -101,6 +105,7 @@ This JSON file defines input parameters for the `ESA_MDC_DataExport.ps1` script 
 | `CSVFileName`     | The name of the file containing the exported MDC recommendations. This file needs to be imported into the Power BI report. You may change it, but it is recommended to keep the default value.                                                                                            |
 | `QueryFile`       | The file containing the KQL query. **Do not modify.**                                                                                                                                                                                                                                      |
 | `SubscriptionIds` | To export data for all available subscriptions, keep the default value `'*'`. Otherwise, specify the subscription IDs to be exported. Example: `["09b43e75...", "4fc2c46b...", ...]`<br>If you don’t have access to some subscriptions, the script will continue with the remaining ones. |
+| `ParallelWorkers` | Default `1` (serial, recommended for most users). Set to `2`–`50` to query subscriptions in parallel for faster runs on large tenants. Values >1 require the `ThreadJob` module (`Install-Module ThreadJob -Scope CurrentUser`) and capture a one-shot bearer token (~60 min lifetime).      |
 
 
 
@@ -117,10 +122,12 @@ This JSON file defines input parameters for the `ESA_MDC_DataExport.ps1` script 
   "CSVFileName": "Export_MCSB_Compliance.csv",
   "QueryFile": "MCSB.kql",
   "SubscriptionIds": ["*"],
+  "ParallelWorkers": 1,
   "_comments": {
     "CSVFileName": "Final CSV output file for Power BI import",
     "QueryFile": "KQL Query file. Do not change!",
-    "SubscriptionIds": "Comma-separated subscription IDs or '*' for all available subscriptions. If you specify specific subscriptions, ensure you connect to the correct tenant (if you have access to multiple tenants) during script execution. If you don't have access to some subscriptions, the script will continue with the remaining ones."
+    "SubscriptionIds": "Comma-separated subscription IDs or '*' for all available subscriptions. If you specify specific subscriptions, ensure you connect to the correct tenant (if you have access to multiple tenants) during script execution. If you don't have access to some subscriptions, the script will continue with the remaining ones.",
+    "ParallelWorkers": "Default 1 (serial). Set to 2-50 to query subscriptions in parallel."
   }
 }
 ```
@@ -132,6 +139,7 @@ This JSON file defines input parameters for the `ESA_MDC_DataExport.ps1` script 
 | `CSVFileName`      | The name of the file containing the exported MCSB recommendations. This file needs to be imported into the Power BI report. You may change it, but it is recommended to keep the default value.                                                                                          |
 | `QueryFile`        | The file containing the KQL query. **Do not modify.**                                                                                                                                                                                                                                      |
 | `SubscriptionIds`  | To export data for all available subscriptions, keep the default value `'*'`. Otherwise, specify the subscription IDs to be exported. Example: `["09b43e75...", "4fc2c46b...", ...]`<br>If you don’t have access to some subscriptions, the script will continue with the remaining ones. |
+| `ParallelWorkers`  | Default `1` (serial, recommended for most users). Set to `2`–`50` to query subscriptions in parallel for faster runs on large tenants. Values >1 require the `ThreadJob` module (`Install-Module ThreadJob -Scope CurrentUser`) and capture a one-shot bearer token (~60 min lifetime).      |
 
 ## 📦 Downloads
 
