@@ -63,6 +63,8 @@ To export both MDC and MCSB data, run the script twice - once with each paramete
 
 **Auto-generated report file:** After every run a `{BaseFileName}_{Timestamp}.report.txt` file is written next to the CSV. It includes environment info (user, tenant, parameter file), the export summary, secure score, per-category subscription ID lists, and next steps when gaps are present.
 
+**Secure-score visibility:** The `EXPORT SUMMARY` block shows `Secure score returned: X of Y subscriptions` so a partial result (e.g., only 1 of 87 subs has a `microsoft.security/securescores` resource) is immediately obvious instead of being presented as a tenant-wide average. The report file lists the affected subscriptions in `SUBSCRIPTIONS WITHOUT SECURE SCORE` (no securescores resource) and `SUBSCRIPTIONS WITH SECURE SCORE QUERY FAILURE` (query errored) sections.
+
 
 ## Execution
 

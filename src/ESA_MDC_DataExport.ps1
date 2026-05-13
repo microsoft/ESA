@@ -349,6 +349,12 @@ $subsNoData         = @()  # Returned 0 records (DfC possibly not onboarded)
 $subsPermissionFail = @()  # AuthorizationFailed / Forbidden / AccessDenied
 $subsOtherFail      = @()  # Gateway timeout after retries, other errors
 
+# Secure score sub-tracking. Distinguishes between subs that returned a score,
+# subs that returned no securescores resource, and subs where the query errored.
+$subsWithSecureScore    = @()
+$subsNoSecureScore      = @()
+$subsSecureScoreFailed  = @()
+
 # Delete all .incomplete files before starting a new export
 $incompleteFiles = Get-ChildItem -Path $PSScriptRoot -Filter "*.incomplete"
 
@@ -764,14 +770,19 @@ try {
             $outputBuffer = New-Object 'System.Collections.Generic.List[string]'
             $outputBuffer.Add(("[{0}/{1}] Querying subscription: {2}" -f $subscriptionIndex, $progress.Total, $subscriptionId)) | Out-Null
 
-            # Secure score (best-effort)
+            # Secure score (best-effort). Track outcome so the end-of-run
+            # summary can distinguish 'no securescores resource' from 'query
+            # failed' - both leave $secureScore = $null otherwise.
+            $secureScoreError = $null
             try {
                 $ssResult = Invoke-WorkerSearchAzGraph -SubscriptionId $subscriptionId -Query $ssQuery -First 1 -OperationName "Secure score query" -OutputBuffer $outputBuffer
                 if ($ssResult.Succeeded -and $ssResult.Result.Count -gt 0 -and $ssResult.Result[0].subscriptionSecureScore) {
                     $secureScore = [double]$ssResult.Result[0].subscriptionSecureScore
+                } elseif (-not $ssResult.Succeeded) {
+                    $secureScoreError = $ssResult.ErrorMessage
                 }
             } catch {
-                # silent best-effort; matches serial behavior
+                $secureScoreError = $_.Exception.Message
             }
 
             # Total records (best-effort)
@@ -834,14 +845,15 @@ try {
             }
 
             [pscustomobject]@{
-                SubscriptionId   = $subscriptionId
-                Index            = $subscriptionIndex
-                SecureScore      = $secureScore
-                RetrievedRecords = $retrievedRecords
-                Failed           = $subscriptionFailed
-                FailureMessage   = $failureMessage
-                CsvPath          = if (Test-Path $csvFragment) { $csvFragment } else { $null }
-                FailedPath       = if (Test-Path $failedFragment) { $failedFragment } else { $null }
+                SubscriptionId    = $subscriptionId
+                Index             = $subscriptionIndex
+                SecureScore       = $secureScore
+                SecureScoreError  = $secureScoreError
+                RetrievedRecords  = $retrievedRecords
+                Failed            = $subscriptionFailed
+                FailureMessage    = $failureMessage
+                CsvPath           = if (Test-Path $csvFragment) { $csvFragment } else { $null }
+                FailedPath        = if (Test-Path $failedFragment) { $failedFragment } else { $null }
             }
         }
 
@@ -899,13 +911,19 @@ try {
             $subscriptionFailed = $false
             $failureMessage   = $null
 
-            # Secure score (best-effort)
+            # Secure score (best-effort). Track outcome so the end-of-run
+            # summary can distinguish 'no securescores resource' from 'query
+            # failed' - both leave $secureScore = $null otherwise.
+            $secureScoreError = $null
             try {
                 $ssResult = Invoke-SearchAzGraphWithRetry -SubscriptionId $SubscriptionId -Query $secureScoreQuery -First 1 -OperationName "Secure score query"
                 if ($ssResult.Succeeded -and $ssResult.Result.Count -gt 0 -and $ssResult.Result[0].subscriptionSecureScore) {
                     $secureScore = [double]$ssResult.Result[0].subscriptionSecureScore
+                } elseif (-not $ssResult.Succeeded) {
+                    $secureScoreError = $ssResult.ErrorMessage
                 }
             } catch {
+                $secureScoreError = $_.Exception.Message
                 Write-Verbose "Secure score query failed for $SubscriptionId"
             }
 
@@ -955,6 +973,7 @@ try {
                 SubscriptionId   = $SubscriptionId
                 Index            = $subscriptionIndex
                 SecureScore      = $secureScore
+                SecureScoreError = $secureScoreError
                 RetrievedRecords = $retrievedRecords
                 Failed           = $subscriptionFailed
                 FailureMessage   = $failureMessage
@@ -984,6 +1003,15 @@ try {
             $subsSuccessful += $r.SubscriptionId
         } else {
             $subsNoData += $r.SubscriptionId
+        }
+
+        # Secure score categorization (independent of recommendation outcome).
+        if ($null -ne $r.SecureScore) {
+            $subsWithSecureScore += $r.SubscriptionId
+        } elseif ($r.SecureScoreError) {
+            $subsSecureScoreFailed += $r.SubscriptionId
+        } else {
+            $subsNoSecureScore += $r.SubscriptionId
         }
     }
 
@@ -1043,6 +1071,16 @@ if ($subsPermissionFail.Count -gt 0) {
 }
 if ($subsOtherFail.Count -gt 0) {
     Write-Host ("Subscriptions failed (other errors):   {0}" -f $subsOtherFail.Count) -ForegroundColor Red
+}
+# Secure-score visibility: surface the X-of-Y rate explicitly so a 1-of-87 case
+# does not get presented as a tenant-wide average.
+$ssReturnedCount = $subsWithSecureScore.Count
+$ssColor = if ($ssReturnedCount -eq $SubscriptionCount -and $SubscriptionCount -gt 0) { 'Green' }
+           elseif ($ssReturnedCount -gt 0) { 'Yellow' }
+           else { 'Red' }
+Write-Host ("Secure score returned:                 {0} of {1} subscriptions" -f $ssReturnedCount, $SubscriptionCount) -ForegroundColor $ssColor
+if ($subsSecureScoreFailed.Count -gt 0) {
+    Write-Host ("Secure score query failed:             {0}" -f $subsSecureScoreFailed.Count) -ForegroundColor Red
 }
 Write-Host ("Script execution time:                 {0}" -f $durationFormatted)
 Write-Host ""
@@ -1115,12 +1153,34 @@ try {
     $reportLines += ""
     if ($secureScoresList.Count -gt 0) {
         $reportLines += "SECURE SCORE"
-        $reportLines += ("  Defender for Cloud Secure Score:    {0}% (avg across {1} subscription(s))" -f $overallSecureScore, $secureScoresList.Count)
+        $reportLines += ("  Defender for Cloud Secure Score:    {0}% (avg across {1} of {2} subscription(s) that reported a score)" -f $overallSecureScore, $secureScoresList.Count, $SubscriptionCount)
+        if ($subsNoSecureScore.Count -gt 0 -or $subsSecureScoreFailed.Count -gt 0) {
+            $reportLines += ("  Note: {0} subscription(s) did not have a 'microsoft.security/securescores' resource (MDC likely not enabled or no Azure resources to evaluate)." -f $subsNoSecureScore.Count)
+            if ($subsSecureScoreFailed.Count -gt 0) {
+                $reportLines += ("        {0} subscription(s) had a query error during secure-score retrieval (see SUBSCRIPTIONS WITH SECURE SCORE QUERY FAILURE below)." -f $subsSecureScoreFailed.Count)
+            }
+        }
+        $reportLines += ""
+    } elseif ($SubscriptionCount -gt 0) {
+        $reportLines += "SECURE SCORE"
+        $reportLines += ("  No subscription returned a Defender for Cloud secure score (0 of {0})." -f $SubscriptionCount)
+        $reportLines += "  This typically means MDC is not enabled on the queried subscriptions."
         $reportLines += ""
     }
     if ($subsSuccessful.Count -gt 0) {
         $reportLines += "SUBSCRIPTIONS WITH DATA"
         foreach ($subId in $subsSuccessful) { $reportLines += "  - $subId" }
+        $reportLines += ""
+    }
+    if ($subsNoSecureScore.Count -gt 0) {
+        $reportLines += "SUBSCRIPTIONS WITHOUT SECURE SCORE"
+        $reportLines += "  These subscriptions returned no 'microsoft.security/securescores' resource."
+        foreach ($subId in $subsNoSecureScore) { $reportLines += "  - $subId" }
+        $reportLines += ""
+    }
+    if ($subsSecureScoreFailed.Count -gt 0) {
+        $reportLines += "SUBSCRIPTIONS WITH SECURE SCORE QUERY FAILURE"
+        foreach ($subId in $subsSecureScoreFailed) { $reportLines += "  - $subId" }
         $reportLines += ""
     }
     if ($subsNoData.Count -gt 0) {
