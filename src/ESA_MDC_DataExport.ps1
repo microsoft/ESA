@@ -44,6 +44,18 @@ if ($isAdmin) {
     exit 1
 }
 
+# Check FullLanguage mode (constrained language mode breaks several Az cmdlets we rely on)
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    Write-Host "Error: PowerShell must run in FullLanguage mode. Current mode: $($ExecutionContext.SessionState.LanguageMode)" -ForegroundColor Red
+    exit 1
+}
+
+# Check not running in Azure Cloud Shell (unsupported environment)
+if ($env:AZUREPS_HOST_ENVIRONMENT -match 'cloud-shell' -or $env:ACC_CLOUD -eq 'true') {
+    Write-Host "Error: This script must not be executed within Azure Cloud Shell." -ForegroundColor Red
+    exit 1
+}
+
 $StartTime = Get-Date
 
 # Required PowerShell modules
@@ -324,10 +336,18 @@ $FileExtension = [System.IO.Path]::GetExtension($parameters.CSVFileName)
 $TempOutputFile = "$BaseFileName`_$Timestamp.incomplete"        # Temporary file used while the script is running
 $FinalOutputFile = "$BaseFileName`_$Timestamp$FileExtension"    # Final output file for Power BI import
 $FailedSubscriptionsFile = "$BaseFileName`_$Timestamp.failed"   # Log file containing failed subscriptions and errors
+$ReportFile = "$BaseFileName`_$Timestamp.report.txt"            # Auto-generated end-of-run summary report
 
 $PageSize = 1000 # Maximum allowed value is 1000. Do not change!
 $SubscriptionCount = 0
 $secureScoresList = @()  
+
+# Subscription tracking for end-of-run summary statistics. Populated after the
+# common aggregation step from each worker's per-subscription return object.
+$subsSuccessful     = @()  # Returned data
+$subsNoData         = @()  # Returned 0 records (DfC possibly not onboarded)
+$subsPermissionFail = @()  # AuthorizationFailed / Forbidden / AccessDenied
+$subsOtherFail      = @()  # Gateway timeout after retries, other errors
 
 # Delete all .incomplete files before starting a new export
 $incompleteFiles = Get-ChildItem -Path $PSScriptRoot -Filter "*.incomplete"
@@ -950,6 +970,23 @@ try {
     $SubscriptionCount = $workerResults.Count
     $secureScoresList  = @($workerResults | Where-Object { $null -ne $_.SecureScore } | Select-Object -ExpandProperty SecureScore)
 
+    # Categorize each subscription's outcome for the end-of-run summary.
+    # Permission errors are detected by pattern-matching the failure message;
+    # everything else that failed is grouped as 'other'.
+    foreach ($r in $workerResults) {
+        if ($r.Failed) {
+            if ($r.FailureMessage -match 'AuthorizationFailed|does not have authorization|Forbidden|AccessDenied') {
+                $subsPermissionFail += $r.SubscriptionId
+            } else {
+                $subsOtherFail += $r.SubscriptionId
+            }
+        } elseif ($r.RetrievedRecords -gt 0) {
+            $subsSuccessful += $r.SubscriptionId
+        } else {
+            $subsNoData += $r.SubscriptionId
+        }
+    }
+
     Write-Host ""
     if ($secureScoresList.Count -gt 0) {
         $overallSecureScore = [math]::Round(($secureScoresList | Measure-Object -Average).Average, 2)
@@ -985,5 +1022,140 @@ try {
 
 $EndTime = Get-Date
 $Duration = $EndTime - $StartTime
-Write-Host "Total subscriptions queried: $SubscriptionCount" 
-Write-Host "Script execution time: $($Duration.Hours)h $($Duration.Minutes)m $($Duration.Seconds)s"
+$durationFormatted = "{0:D1}h {1:D2}m {2:D2}s" -f $Duration.Hours, $Duration.Minutes, $Duration.Seconds
+
+# ----------------------------------------------------------------------------
+# EXPORT SUMMARY
+# ----------------------------------------------------------------------------
+$separator = ('=' * 60)
+Write-Host ""
+Write-Host $separator -ForegroundColor Cyan
+Write-Host " EXPORT SUMMARY" -ForegroundColor Cyan
+Write-Host $separator -ForegroundColor Cyan
+Write-Host ""
+Write-Host ("Total subscriptions queried:           {0}" -f $SubscriptionCount)
+Write-Host ("Subscriptions with data:               {0}" -f $subsSuccessful.Count) -ForegroundColor Green
+if ($subsNoData.Count -gt 0) {
+    Write-Host ("Subscriptions with no data (DfC gap):  {0}" -f $subsNoData.Count) -ForegroundColor Yellow
+}
+if ($subsPermissionFail.Count -gt 0) {
+    Write-Host ("Subscriptions failed (permissions):    {0}" -f $subsPermissionFail.Count) -ForegroundColor Red
+}
+if ($subsOtherFail.Count -gt 0) {
+    Write-Host ("Subscriptions failed (other errors):   {0}" -f $subsOtherFail.Count) -ForegroundColor Red
+}
+Write-Host ("Script execution time:                 {0}" -f $durationFormatted)
+Write-Host ""
+
+# ----------------------------------------------------------------------------
+# CSA Remediation Guidance (only when data quality gaps are detected)
+# ----------------------------------------------------------------------------
+if ($subsNoData.Count -gt 0 -or $subsPermissionFail.Count -gt 0) {
+    Write-Host $separator -ForegroundColor Yellow
+    Write-Host " ATTENTION: Data quality gaps detected" -ForegroundColor Yellow
+    Write-Host $separator -ForegroundColor Yellow
+    Write-Host ""
+    if ($subsNoData.Count -gt 0) {
+        Write-Host "The following subscriptions returned no data, which typically indicates" -ForegroundColor Yellow
+        Write-Host "Microsoft Defender for Cloud is not enabled or not fully onboarded:" -ForegroundColor Yellow
+        foreach ($subId in $subsNoData) { Write-Host "  - $subId" -ForegroundColor Yellow }
+        Write-Host ""
+    }
+    if ($subsPermissionFail.Count -gt 0) {
+        Write-Host "The following subscriptions failed due to missing permissions:" -ForegroundColor Yellow
+        foreach ($subId in $subsPermissionFail) { Write-Host "  - $subId" -ForegroundColor Yellow }
+        Write-Host ""
+    }
+    Write-Host "Impact: Secure Score calculations may be incomplete, and recommendations" -ForegroundColor Yellow
+    Write-Host "may be missing for the affected subscriptions." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "The involved CSA can support remediation of these gaps." -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Options:" -ForegroundColor White
+    Write-Host "  1. Proceed with the ESA based on the current data quality" -ForegroundColor White
+    Write-Host "  2. Engage the CSA to remediate gaps before continuing" -ForegroundColor White
+    Write-Host ""
+    if ($parameters.RemediationUrls -and @($parameters.RemediationUrls).Count -gt 0) {
+        Write-Host "Remediation references:" -ForegroundColor Cyan
+        foreach ($entry in $parameters.RemediationUrls) {
+            if ($entry.Label -and $entry.Url) {
+                Write-Host ("  - {0}: {1}" -f $entry.Label, $entry.Url) -ForegroundColor Cyan
+            }
+        }
+        Write-Host ""
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Generate Report File ({BaseFileName}_{Timestamp}.report.txt)
+# ----------------------------------------------------------------------------
+try {
+    $reportLines = @()
+    $reportLines += $separator
+    $reportLines += " Enterprise Security Assessment - Export Report"
+    $reportLines += (" Generated: {0} UTC" -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))
+    $reportLines += $separator
+    $reportLines += ""
+    $reportLines += "ENVIRONMENT"
+    $reportLines += ("  User:           {0}" -f (Get-AzContext).Account)
+    $reportLines += ("  Tenant:         {0} ({1})" -f $tenantName, $tenantId)
+    $reportLines += ("  Parameter File: {0}" -f $ParameterFile)
+    $reportLines += ""
+    $reportLines += "EXPORT SUMMARY"
+    $reportLines += ("  Subscriptions queried:              {0}" -f $SubscriptionCount)
+    $reportLines += ("  Subscriptions with data:            {0}" -f $subsSuccessful.Count)
+    $reportLines += ("  Subscriptions with no data:         {0}" -f $subsNoData.Count)
+    $reportLines += ("  Failed - missing permissions:       {0}" -f $subsPermissionFail.Count)
+    $reportLines += ("  Failed - other errors:              {0}" -f $subsOtherFail.Count)
+    if (Test-Path $FinalOutputFile) {
+        $reportLines += ("  Output file:                        {0}" -f $FinalOutputFile)
+        $reportLines += ("  Output size:                        {0}" -f (Get-FormattedFileSize -Bytes (Get-Item $FinalOutputFile).Length))
+    }
+    $reportLines += ("  Duration:                           {0}" -f $durationFormatted)
+    $reportLines += ""
+    if ($secureScoresList.Count -gt 0) {
+        $reportLines += "SECURE SCORE"
+        $reportLines += ("  Defender for Cloud Secure Score:    {0}% (avg across {1} subscription(s))" -f $overallSecureScore, $secureScoresList.Count)
+        $reportLines += ""
+    }
+    if ($subsSuccessful.Count -gt 0) {
+        $reportLines += "SUBSCRIPTIONS WITH DATA"
+        foreach ($subId in $subsSuccessful) { $reportLines += "  - $subId" }
+        $reportLines += ""
+    }
+    if ($subsNoData.Count -gt 0) {
+        $reportLines += "SUBSCRIPTIONS WITH NO DATA"
+        foreach ($subId in $subsNoData) { $reportLines += "  - $subId" }
+        $reportLines += ""
+    }
+    if ($subsPermissionFail.Count -gt 0) {
+        $reportLines += "SUBSCRIPTIONS FAILED - PERMISSIONS"
+        foreach ($subId in $subsPermissionFail) { $reportLines += "  - $subId" }
+        $reportLines += ""
+    }
+    if ($subsOtherFail.Count -gt 0) {
+        $reportLines += "SUBSCRIPTIONS FAILED - OTHER ERRORS"
+        foreach ($subId in $subsOtherFail) { $reportLines += "  - $subId" }
+        $reportLines += ""
+    }
+    if ($subsNoData.Count -gt 0 -or $subsPermissionFail.Count -gt 0) {
+        $reportLines += "NEXT STEPS"
+        $reportLines += "  - Engage the CSA to remediate the gaps listed above before continuing."
+        $reportLines += "  - Or proceed with the ESA based on the current data quality."
+        if ($parameters.RemediationUrls -and @($parameters.RemediationUrls).Count -gt 0) {
+            $reportLines += "  Remediation references:"
+            foreach ($entry in $parameters.RemediationUrls) {
+                if ($entry.Label -and $entry.Url) {
+                    $reportLines += ("    - {0}: {1}" -f $entry.Label, $entry.Url)
+                }
+            }
+        }
+        $reportLines += ""
+    }
+    $reportLines += "REMINDER"
+    $reportLines += "  XDR and Purview data must be exported manually."
+    $reportLines | Out-File -FilePath $ReportFile -Encoding UTF8
+    Write-Host ("Export report saved: {0}" -f $ReportFile) -ForegroundColor Green
+} catch {
+    Write-Host ("Warning: failed to write report file: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+}

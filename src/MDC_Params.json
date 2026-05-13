@@ -3,11 +3,16 @@
     "QueryFile": "MDC.kql",
     "SubscriptionIds": ["*"],
     "Parallel": false,
+    "RemediationUrls": [
+        { "Label": "Onboard Defender for Cloud at management group level", "Url": "https://learn.microsoft.com/en-us/azure/defender-for-cloud/enable-defender-for-cloud-management-groups" },
+        { "Label": "Microsoft Cloud Security Benchmark overview",          "Url": "https://learn.microsoft.com/en-us/security/benchmark/azure/overview" }
+    ],
     "_comments": {
         "CSVFileName": "Final CSV output file for Power BI import",
         "QueryFile": "KQL Query file. Do not change!",
         "SubscriptionIds": "Comma-separated subscription IDs or '*' for all available subscriptions. If you specify specific subscriptions, ensure you connect to the correct tenant (if you have access to multiple tenants) during script execution. If you don't have access to some subscriptions, the script will continue with the remaining ones.",
-        "Parallel": "Default false. Set to true to query subscriptions in parallel for faster runs on large tenants - the script auto-sizes the worker pool. EXPERIMENTAL: requires PowerShell 7+ AND the 'ThreadJob' module (the script will offer to install it)."
+        "Parallel": "Default false. Set to true to query subscriptions in parallel for faster runs on large tenants - the script auto-sizes the worker pool. EXPERIMENTAL: requires PowerShell 7+ AND the 'ThreadJob' module (the script will offer to install it).",
+        "RemediationUrls": "Optional. Links shown in the CSA remediation guidance block (and the report file) when data quality gaps are detected. Each entry needs a Label and a Url. Leave the array empty to suppress the reference list."
     }
 }
 
