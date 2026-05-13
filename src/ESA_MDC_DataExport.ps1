@@ -1106,45 +1106,6 @@ Write-Host ("Script execution time:                 {0}" -f $durationFormatted)
 Write-Host ""
 
 # ----------------------------------------------------------------------------
-# CSA Remediation Guidance (only when data quality gaps are detected)
-# ----------------------------------------------------------------------------
-if ($subsNoData.Count -gt 0 -or $subsPermissionFail.Count -gt 0) {
-    Write-Host $separator -ForegroundColor Yellow
-    Write-Host " ATTENTION: Data quality gaps detected" -ForegroundColor Yellow
-    Write-Host $separator -ForegroundColor Yellow
-    Write-Host ""
-    if ($subsNoData.Count -gt 0) {
-        Write-Host "The following subscriptions returned no data, which typically indicates" -ForegroundColor Yellow
-        Write-Host "Microsoft Defender for Cloud is not enabled or not fully onboarded:" -ForegroundColor Yellow
-        foreach ($subId in $subsNoData) { Write-Host "  - $subId" -ForegroundColor Yellow }
-        Write-Host ""
-    }
-    if ($subsPermissionFail.Count -gt 0) {
-        Write-Host "The following subscriptions failed due to missing permissions:" -ForegroundColor Yellow
-        foreach ($subId in $subsPermissionFail) { Write-Host "  - $subId" -ForegroundColor Yellow }
-        Write-Host ""
-    }
-    Write-Host "Impact: Secure Score calculations may be incomplete, and recommendations" -ForegroundColor Yellow
-    Write-Host "may be missing for the affected subscriptions." -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "The involved CSA can support remediation of these gaps." -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "Options:" -ForegroundColor White
-    Write-Host "  1. Proceed with the ESA based on the current data quality" -ForegroundColor White
-    Write-Host "  2. Engage the CSA to remediate gaps before continuing" -ForegroundColor White
-    Write-Host ""
-    if ($parameters.RemediationUrls -and @($parameters.RemediationUrls).Count -gt 0) {
-        Write-Host "Remediation references:" -ForegroundColor Cyan
-        foreach ($entry in $parameters.RemediationUrls) {
-            if ($entry.Label -and $entry.Url) {
-                Write-Host ("  - {0}: {1}" -f $entry.Label, $entry.Url) -ForegroundColor Cyan
-            }
-        }
-        Write-Host ""
-    }
-}
-
-# ----------------------------------------------------------------------------
 # Generate Report File ({BaseFileName}_{Timestamp}.report.txt)
 # ----------------------------------------------------------------------------
 try {
@@ -1236,6 +1197,9 @@ try {
     $reportLines += "  XDR and Purview data must be exported manually."
     $reportLines | Out-File -FilePath $ReportFile -Encoding UTF8
     Write-Host ("Export report saved: {0}" -f $ReportFile) -ForegroundColor Green
+    if ($subsNoData.Count -gt 0 -or $subsPermissionFail.Count -gt 0 -or $subsOtherFail.Count -gt 0 -or $subsSecureScoreFailed.Count -gt 0) {
+        Write-Host ("ATTENTION: Data quality gaps detected. See report file {0} for details." -f $ReportFile) -ForegroundColor Yellow
+    }
 } catch {
     Write-Host ("Warning: failed to write report file: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
 }
