@@ -1153,12 +1153,6 @@ try {
         foreach ($subId in $subsSuccessful) { $reportLines += "  - $subId" }
         $reportLines += ""
     }
-    if ($subsNoSecureScore.Count -gt 0) {
-        $reportLines += "SUBSCRIPTIONS WITHOUT SECURE SCORE"
-        $reportLines += "  These subscriptions returned no 'microsoft.security/securescores' resource."
-        foreach ($subId in $subsNoSecureScore) { $reportLines += "  - $subId" }
-        $reportLines += ""
-    }
     if ($subsSecureScoreFailed.Count -gt 0) {
         $reportLines += "SUBSCRIPTIONS WITH SECURE SCORE QUERY FAILURE"
         foreach ($subId in $subsSecureScoreFailed) { $reportLines += "  - $subId" }
@@ -1166,7 +1160,18 @@ try {
     }
     if ($subsNoData.Count -gt 0) {
         $reportLines += "SUBSCRIPTIONS WITH NO DATA"
+        $reportLines += "  No 'microsoft.security/assessments' rows returned. Typically MDC is not"
+        $reportLines += "  enabled on these subscriptions, or there are no Azure resources to evaluate."
         foreach ($subId in $subsNoData) { $reportLines += "  - $subId" }
+        $reportLines += ""
+    }
+    # Only enumerate the secure-score gap separately when it diverges from
+    # the no-data list (the two normally collapse to the same root cause).
+    $noScoreOnly = @($subsNoSecureScore | Where-Object { $subsNoData -notcontains $_ })
+    if ($noScoreOnly.Count -gt 0) {
+        $reportLines += "SUBSCRIPTIONS WITHOUT SECURE SCORE (but returned recommendations)"
+        $reportLines += "  These returned 'microsoft.security/assessments' rows but no 'securescores' resource."
+        foreach ($subId in $noScoreOnly) { $reportLines += "  - $subId" }
         $reportLines += ""
     }
     if ($subsPermissionFail.Count -gt 0) {
