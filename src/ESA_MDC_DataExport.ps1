@@ -784,10 +784,11 @@ try {
             $subscriptionFailed = $false
             $failureMessage     = $null
 
-            # Buffer per-sub WARNINGS only (errors/retries). The single completion
-            # line is emitted under a lock below so each sub's output stays
-            # together even though workers complete in parallel order.
+            # Buffer per-sub output so the entire block prints atomically (in
+            # completion order) when the worker finishes. Output format matches
+            # the serial path line-for-line.
             $outputBuffer = New-Object 'System.Collections.Generic.List[string]'
+            $outputBuffer.Add(("[{0}/{1}] Querying subscription: {2}" -f $subscriptionIndex, $progress.Total, $subscriptionId)) | Out-Null
 
             # Secure score (best-effort). Track outcome so the end-of-run
             # summary can distinguish 'no securescores resource' from 'query
@@ -825,6 +826,7 @@ try {
                 $batch = $pageResult.Result
                 $batchCount = $batch.Count
                 if ($batchCount -eq 0) {
+                    $outputBuffer.Add("Subscription $subscriptionId - Retrieved 0 records") | Out-Null
                     break
                 }
 
@@ -837,31 +839,27 @@ try {
 
                 $retrievedRecords += $batchCount
                 $skip += $pageSize
+                $remainingRecords = [Math]::Max(0, $totalRecords - $retrievedRecords)
+                $outputBuffer.Add("Subscription $subscriptionId - Retrieved $batchCount records, remaining: $remainingRecords") | Out-Null
 
                 if ($batchCount -lt $pageSize) { break }
             }
 
-            # Print warnings (if any) followed by the single completion line,
-            # under a lock so each sub's output stays together. Completion index
-            # uses $progress.Completed so the displayed counter is monotonic in
-            # completion order rather than submission order.
+            # Print buffered lines atomically (per-sub block, in completion order).
             [System.Threading.Monitor]::Enter($progress.SyncRoot)
             try {
                 $progress.Completed++
                 foreach ($line in $outputBuffer) {
-                    Write-Host $line -ForegroundColor Yellow
+                    if ($line -match '^Warning:') {
+                        Write-Host $line -ForegroundColor Yellow
+                    } elseif ($line -match '- Retrieved 0 records') {
+                        Write-Host $line -ForegroundColor Yellow
+                    } elseif ($line -match '- Retrieved') {
+                        Write-Host $line -ForegroundColor Green
+                    } else {
+                        Write-Host $line
+                    }
                 }
-                $doneColor = if ($subscriptionFailed) { 'Red' }
-                             elseif ($retrievedRecords -gt 0) { 'Green' }
-                             else { 'Yellow' }
-                $doneText = if ($subscriptionFailed) {
-                    $msg = ($failureMessage -replace '\s+', ' ').Trim()
-                    if ($msg.Length -gt 200) { $msg = $msg.Substring(0, 200) + '...' }
-                    "FAILED: $msg"
-                } else {
-                    "Retrieved $retrievedRecords records"
-                }
-                Write-Host ("[{0}/{1} done] {2} - {3}" -f $progress.Completed, $progress.Total, $subscriptionId, $doneText) -ForegroundColor $doneColor
             } finally {
                 [System.Threading.Monitor]::Exit($progress.SyncRoot)
             }
