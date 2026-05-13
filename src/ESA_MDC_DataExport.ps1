@@ -435,10 +435,13 @@ function Invoke-SearchAzGraphWithRetry {
     while ($true) {
         try {
             if ($Skip -gt 0) {
-                $result = @(Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -Skip $Skip -ErrorAction Stop)
+                $response = Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -Skip $Skip -ErrorAction Stop
             } else {
-                $result = @(Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -ErrorAction Stop)
+                $response = Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -ErrorAction Stop
             }
+            # Search-AzGraph (Az.ResourceGraph 1.x) returns a PSResourceGraphResponse<PSObject>
+            # wrapper, NOT an array of rows. Extract .Data so callers see actual record count.
+            $result = if ($response -and $null -ne $response.Data) { @($response.Data) } else { @() }
             return [pscustomobject]@{
                 Succeeded    = $true
                 Result       = $result
@@ -696,10 +699,13 @@ try {
                 while ($true) {
                     try {
                         if ($Skip -gt 0) {
-                            $result = @(Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -Skip $Skip -ErrorAction Stop)
+                            $response = Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -Skip $Skip -ErrorAction Stop
                         } else {
-                            $result = @(Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -ErrorAction Stop)
+                            $response = Search-AzGraph -Query $Query -Subscription $SubscriptionId -First $First -ErrorAction Stop
                         }
+                        # Search-AzGraph (Az.ResourceGraph 1.x) returns a PSResourceGraphResponse<PSObject>
+                        # wrapper, NOT an array of rows. Extract .Data so callers see actual record count.
+                        $result = if ($response -and $null -ne $response.Data) { @($response.Data) } else { @() }
                         return [pscustomobject]@{
                             Succeeded    = $true
                             Result       = $result
