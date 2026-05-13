@@ -670,10 +670,15 @@ try {
             throw "No Az context available; cannot proceed with parallel mode."
         }
 
-        # Synchronized progress counter so output is monotonic across workers.
+        # Synchronized progress + reorder buffer.
+        # Workers don't print directly. They store their buffered output lines
+        # into $progressState.Buffer keyed by submission index. The main thread
+        # drains the buffer in submission order so console output stays sorted
+        # even though workers complete in parallel order.
         $progressState = [hashtable]::Synchronized(@{
             Completed = 0
             Total     = $TotalSubscriptions
+            Buffer    = @{}   # int Index -> string[] (per-sub output lines)
         })
 
         # Auto-detect which ThreadJob module to import (Start-ThreadJob may be
@@ -902,21 +907,13 @@ try {
                 if ($batchCount -lt $pageSize) { break }
             }
 
-            # Print buffered lines atomically (per-sub block, in completion order).
+            # Hand the buffered output off to the main thread, which prints
+            # blocks in submission order. We do NOT Write-Host here; that would
+            # interleave blocks across workers.
             [System.Threading.Monitor]::Enter($progress.SyncRoot)
             try {
+                $progress.Buffer[$subscriptionIndex] = $outputBuffer.ToArray()
                 $progress.Completed++
-                foreach ($line in $outputBuffer) {
-                    if ($line -match '^Warning:') {
-                        Write-Host $line -ForegroundColor Yellow
-                    } elseif ($line -match '- Retrieved 0 records') {
-                        Write-Host $line -ForegroundColor Yellow
-                    } elseif ($line -match '- Retrieved') {
-                        Write-Host $line -ForegroundColor Green
-                    } else {
-                        Write-Host $line
-                    }
-                }
             } finally {
                 [System.Threading.Monitor]::Exit($progress.SyncRoot)
             }
@@ -943,21 +940,84 @@ try {
         }
 
         # Drain output live while jobs run.
-        # Wait-Job | Receive-Job buffers ALL output until every job completes,
-        # which makes the run look frozen. Polling Receive-Job every 250ms
-        # streams worker Write-Host output to the console as soon as workers
-        # emit it, while still capturing return values into $workerResults.
-        $workerResults = @()
-        $running = $true
-        while ($running) {
-            $workerResults += @($jobs | Receive-Job)
-            $running = [bool]($jobs | Where-Object { $_.State -in @('Running','NotStarted') })
-            if ($running) {
-                Start-Sleep -Milliseconds 250
+        #
+        # Workers buffer their per-sub output lines into $progressState.Buffer
+        # (keyed by submission index) instead of printing directly. This loop:
+        #   1. Pulls return values from completed jobs.
+        #   2. Flushes any contiguous range of buffered blocks starting at
+        #      $expectedNext, so console output stays in submission order.
+        #   3. Updates a Write-Progress bar showing done / in-flight / buffered
+        #      counts so the user sees live progress even when a low-index sub
+        #      is slow and is holding back the in-order text flush.
+        $workerResults    = @()
+        $expectedNext     = 1
+        $progressActivity = "Querying $TotalSubscriptions subscriptions"
+
+        $flushBlock = {
+            param($lines)
+            foreach ($line in $lines) {
+                if ($line -match '^Warning:') {
+                    Write-Host $line -ForegroundColor Yellow
+                } elseif ($line -match '- Retrieved 0 records') {
+                    Write-Host $line -ForegroundColor Yellow
+                } elseif ($line -match '- Retrieved') {
+                    Write-Host $line -ForegroundColor Green
+                } else {
+                    Write-Host $line
+                }
             }
         }
-        # Final drain to capture anything emitted between the last poll and job completion.
+
+        while ($true) {
+            $workerResults += @($jobs | Receive-Job)
+
+            # Flush any contiguous in-order blocks.
+            [System.Threading.Monitor]::Enter($progressState.SyncRoot)
+            try {
+                while ($progressState.Buffer.ContainsKey($expectedNext)) {
+                    $blockLines = $progressState.Buffer[$expectedNext]
+                    [void]$progressState.Buffer.Remove($expectedNext)
+                    & $flushBlock $blockLines
+                    $expectedNext++
+                }
+            } finally {
+                [System.Threading.Monitor]::Exit($progressState.SyncRoot)
+            }
+
+            # Update progress bar.
+            $running   = @($jobs | Where-Object { $_.State -in @('Running','NotStarted') })
+            $inFlight  = @($jobs | Where-Object { $_.State -eq 'Running' }).Count
+            $buffered  = $progressState.Buffer.Count
+            $done      = $progressState.Completed
+            $waitingOn = if ($buffered -gt 0) { "; waiting on #$expectedNext" } else { "" }
+            $pct       = if ($TotalSubscriptions -gt 0) { [int](($done / $TotalSubscriptions) * 100) } else { 0 }
+            Write-Progress -Activity $progressActivity `
+                           -Status ("{0}/{1} done; {2} in-flight; {3} buffered{4}" -f $done, $TotalSubscriptions, $inFlight, $buffered, $waitingOn) `
+                           -PercentComplete $pct
+
+            if ($running.Count -eq 0) { break }
+            Start-Sleep -Milliseconds 250
+        }
+
+        # Final drain of return values + any blocks still buffered. If indices
+        # are missing here, the worker crashed before storing its buffer; emit
+        # a placeholder so we never stall the in-order printout.
         $workerResults += @($jobs | Receive-Job)
+        [System.Threading.Monitor]::Enter($progressState.SyncRoot)
+        try {
+            for ($i = $expectedNext; $i -le $TotalSubscriptions; $i++) {
+                if ($progressState.Buffer.ContainsKey($i)) {
+                    & $flushBlock $progressState.Buffer[$i]
+                    [void]$progressState.Buffer.Remove($i)
+                } else {
+                    Write-Host ("[{0}/{1}] (worker produced no output for this subscription)" -f $i, $TotalSubscriptions) -ForegroundColor Red
+                }
+            }
+        } finally {
+            [System.Threading.Monitor]::Exit($progressState.SyncRoot)
+        }
+        Write-Progress -Activity $progressActivity -Completed
+
         $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
 
         # Merge fragments in original subscription order
