@@ -232,7 +232,7 @@ if ($existingContext) {
             # Force re-authentication
             Write-Host "Please log in to Azure..." -ForegroundColor Cyan
             try {
-                $azContext = Connect-AzAccount -Environment $CloudEnvironment -TenantId $currentTenantId -ErrorAction Stop
+                $azContext = Connect-AzAccount -Environment $CloudEnvironment -TenantId $currentTenantId -ErrorAction Stop -WarningAction SilentlyContinue
                 Write-Host "Re-authentication successful." -ForegroundColor Green
             } catch {
                 Write-Host "Authentication failed. Exiting." -ForegroundColor Red
@@ -246,7 +246,7 @@ if ($existingContext) {
 if (-not $azContext) {
     Write-Host "Please log in to Azure..." -ForegroundColor Cyan
     try {
-        $azContext = Connect-AzAccount -Environment $CloudEnvironment -ErrorAction Stop
+        $azContext = Connect-AzAccount -Environment $CloudEnvironment -ErrorAction Stop -WarningAction SilentlyContinue
     } catch {
         Write-Host "Authentication failed. Exiting." -ForegroundColor Red
         exit 1
@@ -254,7 +254,7 @@ if (-not $azContext) {
 
     # Fetch available tenants after authentication
     try {
-        $tenants = Get-AzTenant | Select-Object Id, Name
+        $tenants = Get-AzTenant -WarningAction SilentlyContinue | Select-Object Id, Name
     } catch {
         Write-Host "Error retrieving tenant list. Please check your permissions." -ForegroundColor Red
         exit 1
@@ -291,7 +291,7 @@ if (-not $azContext) {
             Write-Host "Re-authenticating to selected tenant: $tenantName ($tenantId) | Current Tenant $($existingContext.Tenant.Name) ($($existingContext.Tenant.Id))" -ForegroundColor Yellow
             try {
                 Disconnect-AzAccount -ErrorAction SilentlyContinue *>$null  # Ensure clean logout
-                $azContext = Connect-AzAccount -Environment $CloudEnvironment -TenantId $tenantId -ErrorAction Stop
+                $azContext = Connect-AzAccount -Environment $CloudEnvironment -TenantId $tenantId -ErrorAction Stop -WarningAction SilentlyContinue
             } catch {
                 Write-Host "Authentication to selected tenant failed. Exiting." -ForegroundColor Red
                 exit 1
@@ -307,7 +307,7 @@ else {
 }
 
 # Display Tenant Information
-$tenantName = (Get-AzTenant | Where-Object { $_.Id -eq $tenantId } | Select-Object -ExpandProperty Name)
+$tenantName = (Get-AzTenant -WarningAction SilentlyContinue | Where-Object { $_.Id -eq $tenantId } | Select-Object -ExpandProperty Name)
 
 Write-Host "Current tenant: $tenantName ($tenantId)" -ForegroundColor Cyan
 
@@ -315,7 +315,7 @@ Write-Host "Current tenant: $tenantName ($tenantId)" -ForegroundColor Cyan
 if ($parameters.SubscriptionIds -contains '*') {
     Write-Host "Retrieving available subscriptions for the selected tenant ($tenantId)..."
     try {
-        $SubscriptionIds = (Get-AzSubscription -TenantId $tenantId | Select-Object -ExpandProperty Id)
+        $SubscriptionIds = (Get-AzSubscription -TenantId $tenantId -WarningAction SilentlyContinue | Select-Object -ExpandProperty Id)
         if (-Not $SubscriptionIds) {
             Write-Host "Error: No available subscriptions found for tenant $tenantId." -ForegroundColor Red
             exit 1
@@ -331,17 +331,17 @@ if ($parameters.SubscriptionIds -contains '*') {
 # ============================================================================
 # Pre-flight: classify subscriptions to avoid querying ones that can't return
 # MCSB-aligned data. Three batched ARG queries (~3s) bucket each subscription:
-#   - MCSB enabled (ascScore present)         -> queryable, goes through the per-sub loop
-#   - MCSB not assigned                       -> Defender registered but MCSB compliance standard not assigned; skip
-#   - Defender for Cloud not enabled          -> no Microsoft.Security/* resources exist; skip
-#   - No access (pre-flight)                  -> sub not visible at ARM at all (no RBAC); skip
+#   - MCSB enabled (ascScore present)              -> queryable, goes through the per-sub loop
+#   - MCSB not assigned                            -> Defender registered but MCSB compliance standard not assigned; skip
+#   - Defender Foundational CSPM not enabled       -> no Microsoft.Security/* resources exist; skip
+#   - No access (pre-flight)                       -> sub not visible at ARM at all (no RBAC); skip
 # Failures are non-fatal: on any error we fall back to querying every input
 # subscription (existing behavior).
 # ============================================================================
 $AllInputSubscriptionIds  = @($SubscriptionIds)
 $totalInputSubscriptions  = $AllInputSubscriptionIds.Count
 $subsMcsbNotEnabled       = @()  # securityresources visible but no ascScore (MCSB compliance standard not assigned)
-$subsNoSecurityVisibility = @()  # zero securityresources visible (Defender for Cloud not enabled on the sub)
+$subsNoSecurityVisibility = @()  # zero securityresources visible (Defender Foundational CSPM not enabled on the sub)
 $subsNoSubscriptionAccess = @()  # subscription not visible at ARM at all (no RBAC)
 $preflightSucceeded       = $false
 
@@ -373,10 +373,10 @@ if ($totalInputSubscriptions -gt 0) {
         $preflightDuration  = ((Get-Date) - $preflightStartTime).TotalSeconds
         $preflightSucceeded = $true
         Write-Host ("Pre-flight complete in {0:N1}s" -f $preflightDuration) -ForegroundColor DarkGray
-        Write-Host ("  MCSB enabled, will query:        {0}" -f $subsMcsbEnabled.Count) -ForegroundColor Green
-        if ($subsMcsbNotEnabled.Count       -gt 0) { Write-Host ("  MCSB not assigned, skipped:      {0}" -f $subsMcsbNotEnabled.Count)       -ForegroundColor Yellow }
-        if ($subsNoSecurityVisibility.Count -gt 0) { Write-Host ("  Defender not enabled, skipped:   {0}" -f $subsNoSecurityVisibility.Count) -ForegroundColor Yellow }
-        if ($subsNoSubscriptionAccess.Count -gt 0) { Write-Host ("  No access (pre-flight), skipped: {0}" -f $subsNoSubscriptionAccess.Count) -ForegroundColor Red }
+        Write-Host ("  MCSB enabled, will query:                  {0}" -f $subsMcsbEnabled.Count) -ForegroundColor Green
+        if ($subsMcsbNotEnabled.Count       -gt 0) { Write-Host ("  MCSB not assigned, skipped:                {0}" -f $subsMcsbNotEnabled.Count)       -ForegroundColor Yellow }
+        if ($subsNoSecurityVisibility.Count -gt 0) { Write-Host ("  Defender Foundational CSPM not enabled:    {0}" -f $subsNoSecurityVisibility.Count) -ForegroundColor Yellow }
+        if ($subsNoSubscriptionAccess.Count -gt 0) { Write-Host ("  No access (pre-flight), skipped:           {0}" -f $subsNoSubscriptionAccess.Count) -ForegroundColor Red }
 
         # Restrict the per-sub loop to MCSB-enabled subscriptions only.
         $SubscriptionIds = $subsMcsbEnabled
@@ -1242,13 +1242,13 @@ if ($subsOtherFail.Count -gt 0) {
 }
 if ($preflightSucceeded) {
     if ($subsMcsbNotEnabled.Count -gt 0) {
-        Write-Host ("Skipped - MCSB not assigned:           {0}" -f $subsMcsbNotEnabled.Count) -ForegroundColor Yellow
+        Write-Host ("Skipped - MCSB not assigned:                     {0}" -f $subsMcsbNotEnabled.Count) -ForegroundColor Yellow
     }
     if ($subsNoSecurityVisibility.Count -gt 0) {
-        Write-Host ("Skipped - Defender not enabled:        {0}" -f $subsNoSecurityVisibility.Count) -ForegroundColor Yellow
+        Write-Host ("Skipped - Defender Foundational CSPM not enabled: {0}" -f $subsNoSecurityVisibility.Count) -ForegroundColor Yellow
     }
     if ($subsNoSubscriptionAccess.Count -gt 0) {
-        Write-Host ("Skipped - no access (pre-flight):      {0}" -f $subsNoSubscriptionAccess.Count) -ForegroundColor Red
+        Write-Host ("Skipped - no access (pre-flight):                {0}" -f $subsNoSubscriptionAccess.Count) -ForegroundColor Red
     }
 }
 # Secure-score visibility: surface the X-of-Y rate explicitly so a 1-of-87 case
@@ -1291,9 +1291,9 @@ try {
     $reportLines += ("  Failed - access denied (per-query): {0}" -f $subsPermissionFail.Count)
     $reportLines += ("  Failed - other errors:              {0}" -f $subsOtherFail.Count)
     if ($preflightSucceeded) {
-        $reportLines += ("  Skipped - MCSB not assigned:        {0}" -f $subsMcsbNotEnabled.Count)
-        $reportLines += ("  Skipped - Defender not enabled:     {0}" -f $subsNoSecurityVisibility.Count)
-        $reportLines += ("  Skipped - no access (pre-flight):   {0}" -f $subsNoSubscriptionAccess.Count)
+        $reportLines += ("  Skipped - MCSB not assigned:                      {0}" -f $subsMcsbNotEnabled.Count)
+        $reportLines += ("  Skipped - Defender Foundational CSPM not enabled: {0}" -f $subsNoSecurityVisibility.Count)
+        $reportLines += ("  Skipped - no access (pre-flight):                 {0}" -f $subsNoSubscriptionAccess.Count)
     }
     if (Test-Path $FinalOutputFile) {
         $reportLines += ("  Output file:                        {0}" -f $FinalOutputFile)
@@ -1372,13 +1372,13 @@ try {
         $reportLines += ""
     }
     if ($preflightSucceeded -and $subsNoSecurityVisibility.Count -gt 0) {
-        $reportLines += "SUBSCRIPTIONS SKIPPED - DEFENDER FOR CLOUD NOT ENABLED"
+        $reportLines += "SUBSCRIPTIONS SKIPPED - DEFENDER FOUNDATIONAL CSPM NOT ENABLED"
         $reportLines += "  These subscriptions returned zero rows from the 'securityresources' table,"
-        $reportLines += "  meaning Defender for Cloud is not registered on them (no"
-        $reportLines += "  'Microsoft.Security/pricings' resource and the 'Microsoft.Security'"
+        $reportLines += "  meaning Defender for Cloud Foundational CSPM is not enabled on them"
+        $reportLines += "  (no 'Microsoft.Security/pricings' resource, and the 'Microsoft.Security'"
         $reportLines += "  resource provider may also be unregistered)."
-        $reportLines += "  Action: enable Defender for Cloud on each subscription (Foundational CSPM"
-        $reportLines += "  is free), or assign the built-in policy 'Enable Microsoft Defender for"
+        $reportLines += "  Action: enable Defender for Cloud Foundational CSPM (free) on each"
+        $reportLines += "  subscription, or assign the built-in policy 'Enable Microsoft Defender for"
         $reportLines += "  Cloud on your subscription' at a parent management group to onboard them"
         $reportLines += "  in bulk. See https://learn.microsoft.com/azure/defender-for-cloud/onboard-management-group"
         foreach ($subId in $subsNoSecurityVisibility) { $reportLines += "  - $subId" }
