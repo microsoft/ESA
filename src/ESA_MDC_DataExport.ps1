@@ -1225,30 +1225,30 @@ Write-Host " EXPORT SUMMARY" -ForegroundColor Cyan
 Write-Host $separator -ForegroundColor Cyan
 Write-Host ""
 if ($preflightSucceeded -and $totalInputSubscriptions -gt 0) {
-    Write-Host ("Total input subscriptions:             {0}" -f $totalInputSubscriptions)
-    Write-Host ("Subscriptions queried (MCSB enabled):  {0}" -f $SubscriptionCount)
+    Write-Host ("{0,-50}{1}" -f "Total input subscriptions:", $totalInputSubscriptions)
+    Write-Host ("{0,-50}{1}" -f "Subscriptions queried (MCSB enabled):", $SubscriptionCount)
 } else {
-    Write-Host ("Total subscriptions queried:           {0}" -f $SubscriptionCount)
+    Write-Host ("{0,-50}{1}" -f "Total subscriptions queried:", $SubscriptionCount)
 }
-Write-Host ("Subscriptions with data:               {0}" -f $subsSuccessful.Count) -ForegroundColor Green
+Write-Host ("{0,-50}{1}" -f "Subscriptions with data:", $subsSuccessful.Count) -ForegroundColor Green
 if ($subsNoData.Count -gt 0) {
-    Write-Host ("Subscriptions with no data (DfC gap):  {0}" -f $subsNoData.Count) -ForegroundColor Yellow
+    Write-Host ("{0,-50}{1}" -f "Subscriptions with no data (DfC gap):", $subsNoData.Count) -ForegroundColor Yellow
 }
 if ($subsPermissionFail.Count -gt 0) {
-    Write-Host ("Failed - access denied (per-query): {0}" -f $subsPermissionFail.Count) -ForegroundColor Red
+    Write-Host ("{0,-50}{1}" -f "Failed - access denied (per-query):", $subsPermissionFail.Count) -ForegroundColor Red
 }
 if ($subsOtherFail.Count -gt 0) {
-    Write-Host ("Subscriptions failed (other errors):   {0}" -f $subsOtherFail.Count) -ForegroundColor Red
+    Write-Host ("{0,-50}{1}" -f "Subscriptions failed (other errors):", $subsOtherFail.Count) -ForegroundColor Red
 }
 if ($preflightSucceeded) {
     if ($subsMcsbNotEnabled.Count -gt 0) {
-        Write-Host ("Skipped - MCSB not assigned:                     {0}" -f $subsMcsbNotEnabled.Count) -ForegroundColor Yellow
+        Write-Host ("{0,-50}{1}" -f "Skipped - MCSB not assigned:", $subsMcsbNotEnabled.Count) -ForegroundColor Yellow
     }
     if ($subsNoSecurityVisibility.Count -gt 0) {
-        Write-Host ("Skipped - Defender Foundational CSPM not enabled: {0}" -f $subsNoSecurityVisibility.Count) -ForegroundColor Yellow
+        Write-Host ("{0,-50}{1}" -f "Skipped - Defender Foundational CSPM not enabled:", $subsNoSecurityVisibility.Count) -ForegroundColor Yellow
     }
     if ($subsNoSubscriptionAccess.Count -gt 0) {
-        Write-Host ("Skipped - no access (pre-flight):                {0}" -f $subsNoSubscriptionAccess.Count) -ForegroundColor Red
+        Write-Host ("{0,-50}{1}" -f "Skipped - no access (pre-flight):", $subsNoSubscriptionAccess.Count) -ForegroundColor Red
     }
 }
 # Secure-score visibility: surface the X-of-Y rate explicitly so a 1-of-87 case
@@ -1257,11 +1257,11 @@ $ssReturnedCount = $subsWithSecureScore.Count
 $ssColor = if ($ssReturnedCount -eq $SubscriptionCount -and $SubscriptionCount -gt 0) { 'Green' }
            elseif ($ssReturnedCount -gt 0) { 'Yellow' }
            else { 'Red' }
-Write-Host ("Secure score returned:                 {0} of {1} subscriptions" -f $ssReturnedCount, $SubscriptionCount) -ForegroundColor $ssColor
+Write-Host ("{0,-50}{1} of {2} subscriptions" -f "Secure score returned:", $ssReturnedCount, $SubscriptionCount) -ForegroundColor $ssColor
 if ($subsSecureScoreFailed.Count -gt 0) {
-    Write-Host ("Secure score query failed:             {0}" -f $subsSecureScoreFailed.Count) -ForegroundColor Red
+    Write-Host ("{0,-50}{1}" -f "Secure score query failed:", $subsSecureScoreFailed.Count) -ForegroundColor Red
 }
-Write-Host ("Script execution time:                 {0}" -f $durationFormatted)
+Write-Host ("{0,-50}{1}" -f "Script execution time:", $durationFormatted)
 Write-Host ""
 
 # ----------------------------------------------------------------------------
@@ -1281,25 +1281,25 @@ try {
     $reportLines += ""
     $reportLines += "EXPORT SUMMARY"
     if ($preflightSucceeded -and $totalInputSubscriptions -gt 0) {
-        $reportLines += ("  Total input subscriptions:          {0}" -f $totalInputSubscriptions)
-        $reportLines += ("  Queried (MCSB enabled):             {0}" -f $SubscriptionCount)
+        $reportLines += ("  {0,-50}{1}" -f "Total input subscriptions:", $totalInputSubscriptions)
+        $reportLines += ("  {0,-50}{1}" -f "Queried (MCSB enabled):", $SubscriptionCount)
     } else {
-        $reportLines += ("  Subscriptions queried:              {0}" -f $SubscriptionCount)
+        $reportLines += ("  {0,-50}{1}" -f "Subscriptions queried:", $SubscriptionCount)
     }
-    $reportLines += ("  Subscriptions with data:            {0}" -f $subsSuccessful.Count)
-    $reportLines += ("  Subscriptions with no data:         {0}" -f $subsNoData.Count)
-    $reportLines += ("  Failed - access denied (per-query): {0}" -f $subsPermissionFail.Count)
-    $reportLines += ("  Failed - other errors:              {0}" -f $subsOtherFail.Count)
+    $reportLines += ("  {0,-50}{1}" -f "Subscriptions with data:", $subsSuccessful.Count)
+    $reportLines += ("  {0,-50}{1}" -f "Subscriptions with no data:", $subsNoData.Count)
+    $reportLines += ("  {0,-50}{1}" -f "Failed - access denied (per-query):", $subsPermissionFail.Count)
+    $reportLines += ("  {0,-50}{1}" -f "Failed - other errors:", $subsOtherFail.Count)
     if ($preflightSucceeded) {
-        $reportLines += ("  Skipped - MCSB not assigned:                      {0}" -f $subsMcsbNotEnabled.Count)
-        $reportLines += ("  Skipped - Defender Foundational CSPM not enabled: {0}" -f $subsNoSecurityVisibility.Count)
-        $reportLines += ("  Skipped - no access (pre-flight):                 {0}" -f $subsNoSubscriptionAccess.Count)
+        $reportLines += ("  {0,-50}{1}" -f "Skipped - MCSB not assigned:", $subsMcsbNotEnabled.Count)
+        $reportLines += ("  {0,-50}{1}" -f "Skipped - Defender Foundational CSPM not enabled:", $subsNoSecurityVisibility.Count)
+        $reportLines += ("  {0,-50}{1}" -f "Skipped - no access (pre-flight):", $subsNoSubscriptionAccess.Count)
     }
     if (Test-Path $FinalOutputFile) {
-        $reportLines += ("  Output file:                        {0}" -f $FinalOutputFile)
-        $reportLines += ("  Output size:                        {0}" -f (Get-FormattedFileSize -Bytes (Get-Item $FinalOutputFile).Length))
+        $reportLines += ("  {0,-50}{1}" -f "Output file:", $FinalOutputFile)
+        $reportLines += ("  {0,-50}{1}" -f "Output size:", (Get-FormattedFileSize -Bytes (Get-Item $FinalOutputFile).Length))
     }
-    $reportLines += ("  Duration:                           {0}" -f $durationFormatted)
+    $reportLines += ("  {0,-50}{1}" -f "Duration:", $durationFormatted)
     $reportLines += ""
     if ($secureScoresList.Count -gt 0) {
         $reportLines += "SECURE SCORE"
