@@ -278,14 +278,20 @@ if (-not $azContext) {
         # Ask user to select a tenant
         $selectedTenantIndex = Read-Host "`nEnter the number of the tenant you want to use"
 
-        # Validate selection
-        if ($selectedTenantIndex -match "^\d+$" -and $selectedTenantIndex -gt 0 -and $selectedTenantIndex -le $tenants.Count) {
-            $tenantId = $tenants[$selectedTenantIndex - 1].Id
-            $tenantName = $tenants[$selectedTenantIndex - 1].Name
-        } else {
+        # Validate selection. Cast to [int] before range checks so the comparison is numeric,
+        # not lexicographic — otherwise "2" -le "12" is False and valid input is rejected when
+        # there are 10+ tenants (issue #5).
+        if ($selectedTenantIndex -notmatch '^\d+$') {
             Write-Host "Invalid selection. Exiting." -ForegroundColor Red
             exit 1
         }
+        $selectedTenantIndex = [int]$selectedTenantIndex
+        if ($selectedTenantIndex -lt 1 -or $selectedTenantIndex -gt $tenants.Count) {
+            Write-Host "Invalid selection. Exiting." -ForegroundColor Red
+            exit 1
+        }
+        $tenantId   = $tenants[$selectedTenantIndex - 1].Id
+        $tenantName = $tenants[$selectedTenantIndex - 1].Name
 
         if ($existingContext -and $tenantId -ne $existingContext.Tenant.Id) {
             Write-Host "Re-authenticating to selected tenant: $tenantName ($tenantId) | Current Tenant $($existingContext.Tenant.Name) ($($existingContext.Tenant.Id))" -ForegroundColor Yellow
