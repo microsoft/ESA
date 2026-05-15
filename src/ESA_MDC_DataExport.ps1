@@ -34,14 +34,24 @@ if (-not $ParameterFile) {
     exit 1
 }
 
-# Check if the script is running as Administrator
-$isAdmin = ([Security.Principal.WindowsPrincipal] `
-    [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(`
-    [Security.Principal.WindowsBuiltInRole]::Administrator)
+# Check if the script is running as Administrator (Windows) or root (Linux/macOS).
+# On non-Windows PowerShell Core the Windows-only IsInRole check silently returns
+# $false, so root execution would slip through without an explicit platform branch
+# (issue #6). $IsLinux / $IsMacOS are automatic variables in PowerShell Core 6.0+.
+if ($IsLinux -or $IsMacOS) {
+    if ([int](id -u) -eq 0) {
+        Write-Host "Error: This script must NOT be run as root!" -ForegroundColor Red
+        exit 1
+    }
+} else {
+    $isAdmin = ([Security.Principal.WindowsPrincipal] `
+        [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(`
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
 
-if ($isAdmin) {
-    Write-Host "Error: This script must NOT be run as Administrator!" -ForegroundColor Red
-    exit 1
+    if ($isAdmin) {
+        Write-Host "Error: This script must NOT be run as Administrator!" -ForegroundColor Red
+        exit 1
+    }
 }
 
 # Check FullLanguage mode (constrained language mode breaks several Az cmdlets we rely on)
