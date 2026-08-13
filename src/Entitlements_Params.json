@@ -1,0 +1,17 @@
+{
+    "Mode": "Entitlements",
+    "DefenderPlansCSVFileName": "Export_Defender_Plans.csv",
+    "LicenseInventoryCSVFileName": "Export_License_Inventory.csv",
+    "SubscriptionIds": ["*"],
+    "ExportDefenderPlans": true,
+    "ExportLicenseInventory": true,
+    "_comments": {
+        "Mode": "Must be 'Entitlements' to run the licensing export path. Leave this file as-is; use MDC_Params.json / MCSB_Params.json for the recommendation exports.",
+        "DefenderPlansCSVFileName": "Base name for the Defender for Cloud plans CSV. A timestamp is appended automatically. Columns: PlanName, SubPlan, PricingTier, Enabled, Scope (Scope = subscription ID).",
+        "LicenseInventoryCSVFileName": "Base name for the Microsoft 365 license inventory CSV. A timestamp is appended automatically. Columns: SkuPartNumber, ProductName, AssignedUnits, Owned.",
+        "SubscriptionIds": "Comma-separated subscription IDs or '*' for all available subscriptions in the selected tenant. Defender plans are read from every listed subscription; the M365 license inventory is tenant-wide regardless of this list.",
+        "ExportDefenderPlans": "Default true. Set to false to skip the Defender for Cloud plans export.",
+        "ExportLicenseInventory": "Default true. Set to false to skip the Microsoft 365 license inventory export.",
+        "Permissions": "Defender plans need Reader or Security Reader on the subscriptions. The license inventory needs directory read access (e.g. Microsoft Entra Global Reader or Directory.Read.All). Each export is best-effort and independent - if one is not permitted, the other still runs."
+    }
+}
