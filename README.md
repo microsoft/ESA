@@ -12,6 +12,7 @@ This repository contains the necessary files for collecting security and complia
 | ESA_MDC_DataExport.ps1  | PowerShell script that downloads Defender for Cloud recommendations (MCSB regulatory compliance and MDC Secure Score recommendations.) |
 | MDC_Params.json         | Parameter file containing export settings for MDC.                      |
 | MCSB_Params.json        | Parameter file containing export settings for MCSB.                     |
+| Entitlements_Params.json| Parameter file for the optional entitlements export (Defender for Cloud plans + Microsoft 365 license inventory). |
 | MDC.kql                 | The KQL (Kusto Query Language) query executed by the script for MDC.    |
 | MCSB.kql                | The KQL (Kusto Query Language) query executed by the script for MCSB.   |
 
@@ -43,6 +44,7 @@ To run the script, pass the path to a JSON parameter file:
 
 .\ESA_MDC_DataExport.ps1 MDC_Params.json
 .\ESA_MDC_DataExport.ps1 MCSB_Params.json
+.\ESA_MDC_DataExport.ps1 Entitlements_Params.json
 .\ESA_MDC_DataExport.ps1 -CloudEnvironment AzureUSGovernment MDC_Params.json
 .\ESA_MDC_DataExport.ps1 -CloudEnvironment AzureUSGovernment MCSB_Params.json
 ```
@@ -50,6 +52,13 @@ To run the script, pass the path to a JSON parameter file:
 If you run the script without any parameters, a help message will be displayed.
 
 To export both MDC and MCSB data, run the script twice - once with each parameter file.
+
+**Optional entitlements export:** Run the script a third time with `Entitlements_Params.json` to capture licensing context in two CSV files:
+
+- **Defender for Cloud plans** (`Export_Defender_Plans_<timestamp>.csv`) - which Microsoft Defender for Cloud plans are enabled in every in-scope subscription, read in one pass from Azure Resource Graph. Columns: `PlanName, SubPlan, PricingTier, Enabled, Scope` (the `Scope` column holds the subscription ID, so a plan enabled in *N* subscriptions appears on *N* rows).
+- **Microsoft 365 license inventory** (`Export_License_Inventory_<timestamp>.csv`) - the SKUs the tenant already owns, read from Microsoft Graph (`/v1.0/subscribedSkus`). Columns: `SkuPartNumber, ProductName, AssignedUnits, Owned`.
+
+Both exports are **optional and best-effort**: they are independent (if one is not permitted, the other still runs) and they never block the required recommendation exports. The two files are auto-detected by their column headers in the ESA data-prep pipeline, so they can be renamed freely. Permissions: the Defender plans export needs **Reader** or **Security Reader** on the subscriptions; the license inventory needs **directory read access** (e.g. Microsoft Entra **Global Reader** or `Directory.Read.All`). No extra PowerShell modules are required - the license export reuses the existing Azure sign-in to obtain a Microsoft Graph token.
 
 **Retry Logic:** The script retries transient Azure Resource Graph failures automatically. General transient failures (`GatewayTimeout`, `InternalServerError`, `ServiceUnavailable`, network errors, TLS resets) use *exponential backoff* with up to 3 retries (delays of 4 / 8 / 16 seconds). Resource Graph throttling (`RateLimiting`, `TooManyRequests`) uses a more patient *linear* policy with up to 10 retries (delays of 5, 10, 15, … seconds) before a subscription is marked as failed. Status messages are shown during retries.
 
@@ -160,6 +169,32 @@ This JSON file defines input parameters for the `ESA_MDC_DataExport.ps1` script 
 | `Parallel`         | Default `false` (serial). Set to `true` to query subscriptions in parallel for faster runs on large tenants - the script auto-sizes the worker pool. **EXPERIMENTAL** and requires **PowerShell 7+** plus the `ThreadJob` module (the script will offer to install it if missing). Not supported on Windows PowerShell 5.1.      |
 | `RemediationUrls`  | Optional. Array of `{Label, Url}` entries shown in the CSA remediation guidance block (and the report file) when data quality gaps are detected. Leave empty to suppress the reference list.                                                                                              |
 
+# Script Parameter File: `Entitlements_Params.json`
+
+This JSON file drives the **optional entitlements export** (`"Mode": "Entitlements"`). Instead of the recommendation-findings pipeline, the script exports two licensing files that make the ESA roadmap's licensing guidance precise (owned vs. buy vs. enable-a-Defender-plan).
+
+```json
+{
+  "Mode": "Entitlements",
+  "DefenderPlansCSVFileName": "Export_Defender_Plans.csv",
+  "LicenseInventoryCSVFileName": "Export_License_Inventory.csv",
+  "SubscriptionIds": ["*"],
+  "ExportDefenderPlans": true,
+  "ExportLicenseInventory": true
+}
+```
+
+| **Parameter**                 | **Description**                                                                                                                                                                             |
+|-------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `Mode`                        | Must be `"Entitlements"` to run this export path. Any other value (or omitting it) runs the standard MDC/MCSB findings export.                                                              |
+| `DefenderPlansCSVFileName`    | Base name for the Defender for Cloud plans CSV; a timestamp is appended automatically. Columns: `PlanName, SubPlan, PricingTier, Enabled, Scope` (`Scope` = subscription ID).              |
+| `LicenseInventoryCSVFileName` | Base name for the Microsoft 365 license inventory CSV; a timestamp is appended automatically. Columns: `SkuPartNumber, ProductName, AssignedUnits, Owned`.                                 |
+| `SubscriptionIds`             | `'*'` for all subscriptions in the selected tenant, or an explicit list. Defender plans are read from every listed subscription; the license inventory is tenant-wide regardless.          |
+| `ExportDefenderPlans`         | Default `true`. Set to `false` to skip the Defender for Cloud plans export.                                                                                                                |
+| `ExportLicenseInventory`      | Default `true`. Set to `false` to skip the Microsoft 365 license inventory export.                                                                                                         |
+
+**Permissions:** the Defender plans export needs **Reader** or **Security Reader** on the subscriptions; the license inventory needs **directory read access** (e.g. Microsoft Entra **Global Reader** or `Directory.Read.All`). Each export is best-effort and independent - if one is not permitted, the other still runs. No extra modules are required (the license export reuses the current Azure sign-in to mint a Microsoft Graph token). Both files are auto-detected by their column headers in the ESA data-prep pipeline.
+
 ## 📦 Downloads
 
 - [ESA_MDC_DataExport.ps1](https://github.com/microsoft/ESA/blob/main/src/ESA_MDC_DataExport.ps1)
@@ -167,6 +202,7 @@ This JSON file defines input parameters for the `ESA_MDC_DataExport.ps1` script 
 - [MCSB_Params.json](https://github.com/microsoft/ESA/blob/main/src/MCSB_Params.json)
 - [MDC.kql](https://github.com/microsoft/ESA/blob/main/src/MDC.kql)
 - [MDC_Params.json](https://github.com/microsoft/ESA/blob/main/src/MDC_Params.json)
+- [Entitlements_Params.json](https://github.com/microsoft/ESA/blob/main/src/Entitlements_Params.json)
 
 ### 📥 Download All Files via PowerShell
 

@@ -13,16 +13,19 @@ if (-not $ParameterFile) {
     Write-Host "It requires a JSON parameter file specifying query details, output settings, and subscriptions."
     Write-Host ""
     Write-Host "Available parameter files (don't change the file names):"
-    Write-Host "  - MDC_Params.json      (For Defender for Cloud Secure Score Recommendations)"
-    Write-Host "  - MCSB_Params.json     (For MCSB regulatory compliance recommendations)"
+    Write-Host "  - MDC_Params.json           (For Defender for Cloud Secure Score Recommendations)"
+    Write-Host "  - MCSB_Params.json          (For MCSB regulatory compliance recommendations)"
+    Write-Host "  - Entitlements_Params.json  (Optional: Defender for Cloud plans + M365 license inventory)"
     Write-Host ""
     Write-Host "Example usage:"
     Write-Host "  .\ESA_MDC_DataExport.ps1 MDC_Params.json" -ForegroundColor Green
     Write-Host "  .\ESA_MDC_DataExport.ps1 MCSB_Params.json" -ForegroundColor Green
+    Write-Host "  .\ESA_MDC_DataExport.ps1 Entitlements_Params.json" -ForegroundColor Green
     Write-Host "  .\ESA_MDC_DataExport.ps1 -CloudEnvironment AzureUSGovernment MDC_Params.json" -ForegroundColor Green
     Write-Host "  .\ESA_MDC_DataExport.ps1 -CloudEnvironment AzureUSGovernment MCSB_Params.json" -ForegroundColor Green
     Write-Host ""
-    Write-Host "(The script needs to be executed twice to download both the MDC and MCSB recommendations)."
+    Write-Host "(Run the script once per parameter file. The MDC and MCSB recommendation exports are"
+    Write-Host " required; the Entitlements export is optional and produces the licensing insight files.)"
     Write-Host ""
     Write-Host "Note: Required PowerShell modules:" -ForegroundColor Yellow
     Write-Host "  - Az.Accounts"
@@ -122,14 +125,28 @@ if (-Not (Test-Path $ParameterFile)) {
 # Read parameters from JSON file
 $parameters = Get-Content -Path $ParameterFile | ConvertFrom-Json
 
-# Extract and validate required parameters
-if (-Not $parameters.QueryFile) {
-    Write-Host "Error: No QueryFile specified in '$ParameterFile'" -ForegroundColor Red
-    exit 1
-}
-if (-Not $parameters.CSVFileName) {
-    Write-Host "Error: CSVFileName is missing in the parameter file." -ForegroundColor Red
-    exit 1
+# ----------------------------------------------------------------------------
+# Export mode. The default is the findings pipeline (MDC / MCSB recommendations).
+# A parameter file may instead set "Mode": "Entitlements" to run the licensing
+# export path (Defender for Cloud plans via Azure Resource Graph + Microsoft 365
+# license inventory via Microsoft Graph). The entitlements path reuses the same
+# authentication and subscription-resolution logic below, then branches BEFORE
+# the MCSB pre-flight and the per-subscription findings loop.
+# ----------------------------------------------------------------------------
+$Mode = if ($parameters.Mode) { [string]$parameters.Mode } else { 'Findings' }
+$IsEntitlements = $Mode -match '(?i)^entitlement'
+
+# Extract and validate required parameters (findings pipeline only; the
+# entitlements path uses its own output-file settings, validated later).
+if (-not $IsEntitlements) {
+    if (-Not $parameters.QueryFile) {
+        Write-Host "Error: No QueryFile specified in '$ParameterFile'" -ForegroundColor Red
+        exit 1
+    }
+    if (-Not $parameters.CSVFileName) {
+        Write-Host "Error: CSVFileName is missing in the parameter file." -ForegroundColor Red
+        exit 1
+    }
 }
 
 # Parse parallel-mode configuration.
@@ -151,7 +168,9 @@ if ($null -ne $parameters.Parallel) {
 $ParallelWorkers = 1
 
 # PS7 + ThreadJob prerequisites. Run when parallel mode is requested.
-if ($Parallel) {
+# Parallel mode applies only to the findings pipeline; the entitlements export
+# is a couple of batched queries and never needs the worker pool.
+if ($Parallel -and -not $IsEntitlements) {
     # Parallel mode is an EXPERIMENTAL feature and requires PowerShell 7+.
     # On Windows PowerShell 5.1 the parallel code path is intentionally blocked
     # because the ARG REST + ThreadJob combination is only validated on PS 7+.
@@ -194,8 +213,11 @@ if ($Parallel) {
     }
 }
 
-# Read the KQL Query
-$kqlQuery = Get-Content -Path $parameters.QueryFile -Raw -Encoding UTF8
+# Read the KQL Query (findings pipeline only; the entitlements path has no KQL file)
+$kqlQuery = $null
+if (-not $IsEntitlements) {
+    $kqlQuery = Get-Content -Path $parameters.QueryFile -Raw -Encoding UTF8
+}
 
 # Suppress warnings and errors during authentication
 # https://learn.microsoft.com/en-us/powershell/azure/authenticate-interactive
@@ -361,7 +383,11 @@ $subsNoSecurityVisibility = @()  # zero securityresources visible (Defender Foun
 $subsNoSubscriptionAccess = @()  # subscription not visible at ARM at all (no RBAC)
 $preflightSucceeded       = $false
 
-if ($totalInputSubscriptions -gt 0) {
+# The MCSB pre-flight classifies subscriptions for the findings pipeline and
+# restricts the query loop to MCSB-enabled subscriptions. It is intentionally
+# SKIPPED in entitlements mode: the plans/licensing export wants every visible
+# subscription (a Free-tier plan is exactly the data we are capturing).
+if ($totalInputSubscriptions -gt 0 -and -not $IsEntitlements) {
     Write-Host ""
     Write-Host ("Pre-flight: classifying {0} subscription(s)..." -f $totalInputSubscriptions) -ForegroundColor Cyan
     $preflightStartTime = Get-Date
@@ -624,6 +650,381 @@ function Get-FormattedFileSize {
     if ($Bytes -lt 1MB) { return ("{0:N2} KB"    -f ($Bytes / 1KB)) }
     if ($Bytes -lt 1GB) { return ("{0:N2} MB"    -f ($Bytes / 1MB)) }
     return ("{0:N2} GB" -f ($Bytes / 1GB))
+}
+
+# ============================================================================
+# Entitlements export (Mode = "Entitlements")
+#
+# Two optional licensing exports that make the ESA roadmap's licensing guidance
+# precise (owned vs. buy vs. enable-a-Defender-plan). Both are best-effort and
+# independent: a failure in one still writes the other. The output CSV headers
+# are the ones the ESA data-prep pipeline auto-detects by column name, so the
+# customer can hand the files back with no further editing.
+#   1. Defender for Cloud plans   -> Azure Resource Graph (Microsoft.Security/pricings)
+#   2. Microsoft 365 licensing    -> Microsoft Graph (/v1.0/subscribedSkus)
+# ============================================================================
+
+# Best-effort friendly names for common Microsoft 365 / security SKUs. Microsoft
+# Graph subscribedSkus returns only the skuPartNumber; this map adds a readable
+# ProductName for the CSA. It is intentionally small and NON-authoritative -- any
+# skuPartNumber not listed falls back to the skuPartNumber itself, which is the
+# value the data-prep pipeline actually keys on, so an unmapped SKU is harmless.
+$script:M365SkuFriendlyNames = @{
+    'SPE_E5'                     = 'Microsoft 365 E5'
+    'SPE_E3'                     = 'Microsoft 365 E3'
+    'SPE_F1'                     = 'Microsoft 365 F3'
+    'ENTERPRISEPREMIUM'          = 'Office 365 E5'
+    'ENTERPRISEPACK'             = 'Office 365 E3'
+    'STANDARDPACK'               = 'Office 365 E1'
+    'DESKLESSPACK'               = 'Office 365 F3'
+    'EMS'                        = 'Enterprise Mobility + Security E3'
+    'EMSPREMIUM'                 = 'Enterprise Mobility + Security E5'
+    'AAD_PREMIUM'                = 'Microsoft Entra ID P1'
+    'AAD_PREMIUM_P2'             = 'Microsoft Entra ID P2'
+    'IDENTITY_THREAT_PROTECTION' = 'Microsoft 365 E5 Security'
+    'INFORMATION_PROTECTION_COMPLIANCE' = 'Microsoft 365 E5 Compliance'
+    'ATP_ENTERPRISE'             = 'Microsoft Defender for Office 365 (Plan 1)'
+    'THREAT_INTELLIGENCE'        = 'Microsoft Defender for Office 365 (Plan 2)'
+    'ATA'                        = 'Microsoft Defender for Identity'
+    'MDATP_XPLAT'                = 'Microsoft Defender for Endpoint'
+    'WIN_DEF_ATP'                = 'Microsoft Defender for Endpoint (Plan 2)'
+    'DEFENDER_ENDPOINT_P1'       = 'Microsoft Defender for Endpoint (Plan 1)'
+    'MCAS'                       = 'Microsoft Defender for Cloud Apps'
+    'ADALLOM_STANDALONE'         = 'Microsoft Defender for Cloud Apps'
+    'M365_SECURITY_COMPLIANCE_FOR_FLW' = 'Microsoft 365 F5 Security + Compliance'
+    'SPE_F5_SEC'                 = 'Microsoft 365 F5 Security'
+    'SPE_E5_CALPACK'             = 'Microsoft 365 E5 Compliance and Security'
+    'Microsoft_365_Copilot'      = 'Microsoft 365 Copilot'
+    'FLOW_FREE'                  = 'Microsoft Power Automate Free'
+    'POWER_BI_STANDARD'          = 'Power BI (free)'
+    'POWER_BI_PRO'               = 'Power BI Pro'
+    'MICROSOFT_BUSINESS_CENTER'  = 'Microsoft Business Center'
+    'RIGHTSMANAGEMENT'           = 'Azure Information Protection Plan 1'
+    'EXCHANGESTANDARD'           = 'Exchange Online (Plan 1)'
+    'EXCHANGEENTERPRISE'         = 'Exchange Online (Plan 2)'
+}
+
+function Get-M365ProductName {
+    param([string] $SkuPartNumber)
+    if (-not $SkuPartNumber) { return '' }
+    if ($script:M365SkuFriendlyNames.ContainsKey($SkuPartNumber)) {
+        return $script:M365SkuFriendlyNames[$SkuPartNumber]
+    }
+    return $SkuPartNumber
+}
+
+function Export-EsaDefenderPlans {
+    <#
+        Exports the enabled/disabled Microsoft Defender for Cloud plans for every
+        supplied subscription via Azure Resource Graph (no per-plan portal clicks).
+        One batched query per <=1000-subscription chunk, paged. Returns the row
+        objects written (or $null on hard failure). Output columns:
+            PlanName, SubPlan, PricingTier, Enabled, Scope
+    #>
+    param(
+        [Parameter(Mandatory)] [string[]] $SubscriptionIds,
+        [Parameter(Mandatory)] [string]   $OutputFile
+    )
+
+    $query = @'
+securityresources
+| where type == "microsoft.security/pricings"
+| project subscriptionId,
+          planName = tostring(name),
+          subPlan = tostring(properties.subPlan),
+          pricingTier = tostring(properties.pricingTier)
+'@
+
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    # ARG accepts up to 1000 subscriptions per call; chunk defensively.
+    $chunkSize = 1000
+    for ($ci = 0; $ci -lt $SubscriptionIds.Count; $ci += $chunkSize) {
+        $chunk = $SubscriptionIds[$ci..([Math]::Min($ci + $chunkSize - 1, $SubscriptionIds.Count - 1))]
+        $skip = 0
+        while ($true) {
+            $attempt = 0
+            $maxAttempts = 4
+            $resp = $null
+            $lastError = $null
+            while ($attempt -lt $maxAttempts) {
+                try {
+                    if ($skip -gt 0) {
+                        $resp = Search-AzGraph -Query $query -Subscription $chunk -First 1000 -Skip $skip -ErrorAction Stop
+                    } else {
+                        $resp = Search-AzGraph -Query $query -Subscription $chunk -First 1000 -ErrorAction Stop
+                    }
+                    $lastError = $null
+                    break
+                } catch {
+                    $lastError = $_
+                    $attempt++
+                    if ($attempt -lt $maxAttempts) {
+                        $delay = [math]::Pow(2, $attempt)
+                        Write-Host ("Warning: Defender plans query failed (attempt {0}/{1}); retrying in {2}s..." -f $attempt, $maxAttempts, $delay) -ForegroundColor Yellow
+                        Start-Sleep -Seconds $delay
+                    }
+                }
+            }
+            if ($lastError) {
+                Write-Host ("Warning: Defender plans query failed after {0} attempts: {1}" -f $maxAttempts, ($lastError.Exception.Message)) -ForegroundColor Yellow
+                return $null
+            }
+
+            $data = if ($null -eq $resp) { @() }
+                    elseif ($resp.PSObject.Properties.Name -contains 'Data') { @($resp.Data) }
+                    else { @($resp) }
+            if ($data.Count -eq 0) { break }
+
+            foreach ($d in $data) {
+                $tier = "$($d.pricingTier)".Trim()
+                $enabled = if ($tier -match '(?i)standard') { 'Yes' }
+                           elseif ($tier -match '(?i)free') { 'No' }
+                           else { 'Unknown' }
+                $rows.Add([pscustomobject][ordered]@{
+                    PlanName    = "$($d.planName)".Trim()
+                    SubPlan     = "$($d.subPlan)".Trim()
+                    PricingTier = $tier
+                    Enabled     = $enabled
+                    Scope       = "$($d.subscriptionId)".Trim()
+                }) | Out-Null
+            }
+
+            if ($data.Count -lt 1000) { break }
+            $skip += 1000
+        }
+    }
+
+    $sorted = @($rows | Sort-Object Scope, PlanName)
+    $sorted | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+    return $sorted
+}
+
+function Export-EsaLicenseInventory {
+    <#
+        Exports the Microsoft 365 / security SKUs owned by the in-scope tenant via
+        Microsoft Graph (/v1.0/subscribedSkus), reusing the current Azure session
+        to mint a Graph token (no extra module). Returns the row objects written
+        (or $null on hard failure). Output columns:
+            SkuPartNumber, ProductName, AssignedUnits, Owned
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $GraphResource,
+        [Parameter(Mandatory)] [string] $TenantId,
+        [Parameter(Mandatory)] [string] $OutputFile
+    )
+
+    try {
+        $tok = Get-AzAccessToken -ResourceUrl $GraphResource -TenantId $TenantId -ErrorAction Stop
+    } catch {
+        Write-Host ("Warning: could not acquire a Microsoft Graph token for the license inventory: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+        Write-Host "  The M365 license inventory needs directory read access (e.g. Global Reader or Directory.Read.All)." -ForegroundColor Yellow
+        return $null
+    }
+
+    # Az.Accounts 5.x returns the token as a SecureString by default; earlier
+    # versions return a plain string. Normalize to a plain bearer string.
+    $access = if ($tok.Token -is [System.Security.SecureString]) {
+        [System.Net.NetworkCredential]::new('', $tok.Token).Password
+    } else {
+        [string]$tok.Token
+    }
+    if (-not $access) {
+        Write-Host "Warning: Microsoft Graph token was empty; skipping license inventory." -ForegroundColor Yellow
+        return $null
+    }
+
+    $headers = @{ Authorization = "Bearer $access" }
+    $uri = "$GraphResource/v1.0/subscribedSkus?`$select=skuId,skuPartNumber,consumedUnits,prepaidUnits,capabilityStatus,appliesTo"
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+
+    while ($uri) {
+        try {
+            $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+        } catch {
+            $status = $null
+            try { $status = $_.Exception.Response.StatusCode.value__ } catch {}
+            if ($status -eq 403) {
+                Write-Host "Warning: Microsoft Graph returned 403 Forbidden for subscribedSkus." -ForegroundColor Yellow
+                Write-Host "  The signed-in user needs directory read access (e.g. Global Reader or Directory.Read.All) to export the license inventory." -ForegroundColor Yellow
+            } else {
+                Write-Host ("Warning: subscribedSkus query failed: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+            }
+            return $null
+        }
+
+        foreach ($s in @($resp.value)) {
+            $prepaid = 0
+            if ($s.prepaidUnits -and $null -ne $s.prepaidUnits.enabled) { $prepaid = [int]$s.prepaidUnits.enabled }
+            $owned = if ($prepaid -gt 0) { 'Yes' } else { 'No' }
+            $rows.Add([pscustomobject][ordered]@{
+                SkuPartNumber = "$($s.skuPartNumber)".Trim()
+                ProductName   = Get-M365ProductName "$($s.skuPartNumber)".Trim()
+                AssignedUnits = $prepaid
+                Owned         = $owned
+            }) | Out-Null
+        }
+
+        $uri = if ($resp.PSObject.Properties.Name -contains '@odata.nextLink') { $resp.'@odata.nextLink' } else { $null }
+    }
+
+    $sorted = @($rows | Sort-Object SkuPartNumber)
+    $sorted | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+    return $sorted
+}
+
+# ----------------------------------------------------------------------------
+# Entitlements mode: run the two exports, write a report, and exit before the
+# findings pipeline. All authentication, tenant selection, and subscription
+# resolution above is shared with the findings path; only this branch differs.
+# ----------------------------------------------------------------------------
+if ($IsEntitlements) {
+    $graphResource = if ($CloudEnvironment -eq 'AzureUSGovernment') { 'https://graph.microsoft.us' } else { 'https://graph.microsoft.com' }
+
+    # Output file names (param file may override; timestamped like the findings export).
+    $plansBaseName   = if ($parameters.DefenderPlansCSVFileName)   { [System.IO.Path]::GetFileNameWithoutExtension($parameters.DefenderPlansCSVFileName) }   else { 'Export_Defender_Plans' }
+    $licenseBaseName = if ($parameters.LicenseInventoryCSVFileName){ [System.IO.Path]::GetFileNameWithoutExtension($parameters.LicenseInventoryCSVFileName) } else { 'Export_License_Inventory' }
+    $plansOutputFile   = "$plansBaseName`_$Timestamp.csv"
+    $licenseOutputFile = "$licenseBaseName`_$Timestamp.csv"
+    $entReportFile     = "Entitlements_$Timestamp.report.txt"
+
+    # Which exports to run (default: both).
+    $doPlans = $true
+    if ($null -ne $parameters.ExportDefenderPlans) {
+        try { $doPlans = [bool]::Parse([string]$parameters.ExportDefenderPlans) } catch { $doPlans = $true }
+    }
+    $doLicense = $true
+    if ($null -ne $parameters.ExportLicenseInventory) {
+        try { $doLicense = [bool]::Parse([string]$parameters.ExportLicenseInventory) } catch { $doLicense = $true }
+    }
+
+    Write-Host ""
+    Write-Host ("Entitlements export mode. Tenant: {0} ({1})" -f $tenantName, $tenantId) -ForegroundColor Cyan
+    Write-Host ("Subscriptions in scope: {0}" -f @($SubscriptionIds).Count) -ForegroundColor Cyan
+    Write-Host ""
+
+    $planRows    = $null
+    $licenseRows = $null
+
+    # --- 1. Defender for Cloud plans (Azure Resource Graph) ---
+    if ($doPlans) {
+        if (@($SubscriptionIds).Count -eq 0) {
+            Write-Host "Skipping Defender for Cloud plans export: no subscriptions in scope." -ForegroundColor Yellow
+        } else {
+            Write-Host "Exporting Microsoft Defender for Cloud plans across all in-scope subscriptions..." -ForegroundColor Cyan
+            try {
+                $planRows = Export-EsaDefenderPlans -SubscriptionIds @($SubscriptionIds) -OutputFile $plansOutputFile
+            } catch {
+                Write-Host ("Warning: Defender for Cloud plans export failed: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+                $planRows = $null
+            }
+            if ($null -ne $planRows -and (Test-Path $plansOutputFile)) {
+                $planSize = Get-FormattedFileSize -Bytes (Get-Item $plansOutputFile).Length
+                Write-Host ("  Wrote {0} plan row(s) to {1} ({2})" -f @($planRows).Count, $plansOutputFile, $planSize) -ForegroundColor Green
+            } else {
+                Write-Host "  No Defender for Cloud plans were exported." -ForegroundColor Yellow
+            }
+        }
+    } else {
+        Write-Host "Defender for Cloud plans export disabled in the parameter file (ExportDefenderPlans: false)." -ForegroundColor DarkGray
+    }
+
+    Write-Host ""
+
+    # --- 2. Microsoft 365 license inventory (Microsoft Graph) ---
+    if ($doLicense) {
+        Write-Host "Exporting Microsoft 365 license inventory (subscribedSkus) for the tenant..." -ForegroundColor Cyan
+        try {
+            $licenseRows = Export-EsaLicenseInventory -GraphResource $graphResource -TenantId $tenantId -OutputFile $licenseOutputFile
+        } catch {
+            Write-Host ("Warning: license inventory export failed: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+            $licenseRows = $null
+        }
+        if ($null -ne $licenseRows -and (Test-Path $licenseOutputFile)) {
+            $licSize = Get-FormattedFileSize -Bytes (Get-Item $licenseOutputFile).Length
+            Write-Host ("  Wrote {0} SKU row(s) to {1} ({2})" -f @($licenseRows).Count, $licenseOutputFile, $licSize) -ForegroundColor Green
+        } else {
+            Write-Host "  No license inventory was exported." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "License inventory export disabled in the parameter file (ExportLicenseInventory: false)." -ForegroundColor DarkGray
+    }
+
+    # --- Summary + report ---
+    $EndTime = Get-Date
+    $Duration = $EndTime - $StartTime
+    $durationFormatted = "{0:D1}h {1:D2}m {2:D2}s" -f $Duration.Hours, $Duration.Minutes, $Duration.Seconds
+
+    $planCount        = if ($planRows)    { @($planRows).Count }    else { 0 }
+    $planSubsWithStd  = if ($planRows)    { @($planRows | Where-Object { $_.Enabled -eq 'Yes' } | Select-Object -ExpandProperty Scope -Unique).Count } else { 0 }
+    $planSubsTotal    = if ($planRows)    { @($planRows | Select-Object -ExpandProperty Scope -Unique).Count } else { 0 }
+    $licCount         = if ($licenseRows) { @($licenseRows).Count } else { 0 }
+    $licOwned         = if ($licenseRows) { @($licenseRows | Where-Object { $_.Owned -eq 'Yes' }).Count } else { 0 }
+
+    $separator = ('=' * 60)
+    Write-Host ""
+    Write-Host $separator -ForegroundColor Cyan
+    Write-Host " ENTITLEMENTS EXPORT SUMMARY" -ForegroundColor Cyan
+    Write-Host $separator -ForegroundColor Cyan
+    Write-Host ("{0,-45}{1}" -f "Subscriptions in scope:", @($SubscriptionIds).Count)
+    if ($doPlans) {
+        Write-Host ("{0,-45}{1}" -f "Defender plan rows exported:", $planCount) -ForegroundColor Green
+        Write-Host ("{0,-45}{1} of {2}" -f "Subscriptions with >=1 Standard plan:", $planSubsWithStd, $planSubsTotal)
+    }
+    if ($doLicense) {
+        Write-Host ("{0,-45}{1}" -f "License SKUs exported:", $licCount) -ForegroundColor Green
+        Write-Host ("{0,-45}{1}" -f "SKUs owned (units > 0):", $licOwned)
+    }
+    Write-Host ("{0,-45}{1}" -f "Script execution time:", $durationFormatted)
+    Write-Host ""
+
+    try {
+        $r = @()
+        $r += $separator
+        $r += " Enterprise Security Assessment - Entitlements Export Report"
+        $r += (" Generated: {0} UTC" -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))
+        $r += $separator
+        $r += ""
+        $r += "ENVIRONMENT"
+        $r += ("  User:           {0}" -f (Get-AzContext).Account)
+        $r += ("  Tenant:         {0} ({1})" -f $tenantName, $tenantId)
+        $r += ("  Cloud:          {0}" -f $CloudEnvironment)
+        $r += ("  Parameter File: {0}" -f $ParameterFile)
+        $r += ("  Subscriptions:  {0} in scope" -f @($SubscriptionIds).Count)
+        $r += ""
+        $r += "OUTPUT FILES"
+        if ($doPlans -and (Test-Path $plansOutputFile)) {
+            $r += ("  Defender for Cloud plans:  {0} ({1} row(s))" -f $plansOutputFile, $planCount)
+        } elseif ($doPlans) {
+            $r += "  Defender for Cloud plans:  NOT WRITTEN (see warnings above)"
+        }
+        if ($doLicense -and (Test-Path $licenseOutputFile)) {
+            $r += ("  M365 license inventory:    {0} ({1} row(s))" -f $licenseOutputFile, $licCount)
+        } elseif ($doLicense) {
+            $r += "  M365 license inventory:    NOT WRITTEN (see warnings above)"
+        }
+        $r += ("  Duration:                  {0}" -f $durationFormatted)
+        $r += ""
+        $r += "NOTES"
+        $r += "  - These two files are OPTIONAL entitlement inputs for the ESA. They are"
+        $r += "    auto-detected by their column headers, so you can rename them freely."
+        $r += "  - Defender for Cloud plans are read per subscription; the Scope column holds"
+        $r += "    each row's subscription ID. A plan enabled in N subscriptions appears on N rows."
+        $r += "  - The M365 license inventory is tenant-wide (subscribedSkus)."
+        $r += ""
+        $r += "PERMISSIONS"
+        $r += "  - Defender plans:      Reader or Security Reader on the subscriptions."
+        $r += "  - License inventory:   directory read access (e.g. Global Reader or Directory.Read.All)."
+        $r += ""
+        $r += "REMINDER"
+        $r += "  The entitlement files supplement, and do NOT replace, the required MDC and"
+        $r += "  MCSB recommendation exports and the manual XDR / Purview exports."
+        $r | Out-File -FilePath $entReportFile -Encoding UTF8
+        Write-Host ("Entitlements report saved: {0}" -f $entReportFile) -ForegroundColor Green
+    } catch {
+        Write-Host ("Warning: failed to write entitlements report file: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+    }
+
+    exit 0
 }
 
 # ============================================================================
