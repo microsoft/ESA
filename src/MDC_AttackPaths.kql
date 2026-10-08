@@ -1,0 +1,46 @@
+securityresources
+| where type in~ ("microsoft.security/attackpaths", "microsoft.security/locations/attackpaths")
+| extend attackPathId = tostring(coalesce(properties.attackPathId, properties.AttackPathID, name)),
+    attackPathResourceId = id,
+    displayName = tostring(properties.displayName),
+    attackPathType = tostring(properties.attackPathType),
+    riskLevel = tostring(properties.riskLevel),
+    isPartialAttackPath = toint(properties.isPartialAttackPath),
+    description = tostring(properties.description),
+    entryPointId = tostring(coalesce(properties.entryPoint.entityInternalId, properties.entryPointEntityInternalId, properties.entryPointEntityInternalID)),
+    entryPointName = tostring(properties.entryPoint.entityName),
+    entryPointType = tostring(properties.entryPoint.entityType),
+    entryPointResourceId = tostring(properties.entryPoint.entityIdentifiers.azureResourceId),
+    targetId = tostring(coalesce(properties.target.entityInternalId, properties.targetEntityInternalId, properties.targetEntityInternalID)),
+    targetName = tostring(properties.target.entityName),
+    targetType = tostring(properties.target.entityType),
+    targetResourceId = tostring(properties.target.entityIdentifiers.azureResourceId),
+    attackStory = tostring(properties.attackStory),
+    manualRemediationSteps = tostring(properties.manualRemediationSteps),
+    attackPathVersion = tostring(properties.attackPathVersion),
+    refreshInterval = tostring(properties.refreshInterval),
+    graphComponentJson = tostring(iff(isnull(properties.graphComponent), dynamic({}), properties.graphComponent)),
+    recommendationsJson = tostring(iff(isnull(properties.assessments), dynamic({}), properties.assessments)),
+    attackPathStepsJson = tostring(iff(isnull(properties.attackPathSteps), dynamic({}), properties.attackPathSteps)),
+    mitreTacticsAndTechniquesJson = tostring(iff(isnull(properties.mITRETacticsAndTechniques), dynamic({}), properties.mITRETacticsAndTechniques)),
+    riskFactorsJson = tostring(iff(isnull(properties.riskFactors), dynamic([]), properties.riskFactors)),
+    entryPointJson = tostring(iff(isnull(properties.entryPoint), dynamic({}), properties.entryPoint)),
+    targetJson = tostring(iff(isnull(properties.target), dynamic({}), properties.target)),
+    recommendationCategoriesJson = tostring(iff(isnull(properties.assessmentCategories), dynamic({}), properties.assessmentCategories))
+| extend azurePortalAttackPathLink = iff(isempty(attackPathType) or isempty(attackPathId), "",
+    strcat("__ESA_PORTAL_BASE_URL__/#view/Microsoft_Azure_Security/AttackPathType.ReactView/attackPathType/", attackPathType, "/attackPathTypeName/", url_encode_component(displayName), "/attackPathId/", attackPathId))
+| join kind=leftouter (
+    resourcecontainers
+    | where type =~ "microsoft.resources/subscriptions"
+    | project subscriptionId, subscriptionName = name
+) on subscriptionId
+| project attackPathId, attackPathResourceId, subscriptionId,
+    subscriptionName = iff(isempty(subscriptionName), subscriptionId, subscriptionName),
+    azurePortalAttackPathLink,
+    displayName, attackPathType, riskLevel, isPartialAttackPath, description,
+    entryPointId, entryPointName, entryPointType, entryPointResourceId,
+    targetId, targetName, targetType, targetResourceId,
+    attackStory, manualRemediationSteps, attackPathVersion, refreshInterval,
+    graphComponentJson, recommendationsJson, attackPathStepsJson,
+    mitreTacticsAndTechniquesJson, riskFactorsJson, entryPointJson, targetJson, recommendationCategoriesJson
+| order by attackPathId asc, attackPathResourceId asc

@@ -1,31 +1,39 @@
-# Version 1.0
+# Version 1.1
 param(
     [string]$ParameterFile,
     [string] [ValidateSet("AzureCloud", "AzureUSGovernment")]
-    $CloudEnvironment = "AzureCloud"
+    $CloudEnvironment = "AzureCloud",
+    [switch]$All,
+    [Parameter(DontShow)][hashtable]$AllRunState
 )
 
 # Display usage instructions if no parameter file is provided
-if (-not $ParameterFile) {
+if (-not $ParameterFile -and -not $All) {
     Write-Host "Usage: ESA_MDC_DataExport.ps1 <ParameterFile>" -ForegroundColor Cyan
+    Write-Host "       ESA_MDC_DataExport.ps1 -All" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "This script exports Defender for Cloud (MDC) or MCSB compliance recommendations from Azure Resource Graph."
+    Write-Host "This script exports classic or risk-based Defender for Cloud (MDC) recommendations, or MCSB compliance recommendations, from Azure Resource Graph."
     Write-Host "It requires a JSON parameter file specifying query details, output settings, and subscriptions."
     Write-Host ""
     Write-Host "Available parameter files (don't change the file names):"
     Write-Host "  - MDC_Params.json           (For Defender for Cloud Secure Score Recommendations)"
+    Write-Host "  - MDC_RiskBased_Params.json (Optional: Defender for Cloud risk-based recommendations)"
     Write-Host "  - MCSB_Params.json          (For MCSB regulatory compliance recommendations)"
     Write-Host "  - Entitlements_Params.json  (Optional: Defender for Cloud plans + M365 license inventory)"
     Write-Host ""
     Write-Host "Example usage:"
+    Write-Host "  .\ESA_MDC_DataExport.ps1 -All" -ForegroundColor Green
     Write-Host "  .\ESA_MDC_DataExport.ps1 MDC_Params.json" -ForegroundColor Green
+    Write-Host "  .\ESA_MDC_DataExport.ps1 MDC_RiskBased_Params.json" -ForegroundColor Green
     Write-Host "  .\ESA_MDC_DataExport.ps1 MCSB_Params.json" -ForegroundColor Green
     Write-Host "  .\ESA_MDC_DataExport.ps1 Entitlements_Params.json" -ForegroundColor Green
     Write-Host "  .\ESA_MDC_DataExport.ps1 -CloudEnvironment AzureUSGovernment MDC_Params.json" -ForegroundColor Green
     Write-Host "  .\ESA_MDC_DataExport.ps1 -CloudEnvironment AzureUSGovernment MCSB_Params.json" -ForegroundColor Green
     Write-Host ""
-    Write-Host "(Run the script once per parameter file. The MDC and MCSB recommendation exports are"
-    Write-Host " required; the Entitlements export is optional and produces the licensing insight files.)"
+    Write-Host "Use -All to run MDC_Params.json, MCSB_Params.json, and MDC_RiskBased_Params.json together."
+    Write-Host "Each existing configuration keeps its own settings; no shared configuration is required."
+    Write-Host "Individual parameter-file commands and optional Entitlements remain available."
+    Write-Host "RiskBased writes both a recommendations CSV and an attack paths CSV."
     Write-Host ""
     Write-Host "Note: Required PowerShell modules:" -ForegroundColor Yellow
     Write-Host "  - Az.Accounts"
@@ -35,6 +43,10 @@ if (-not $ParameterFile) {
     Write-Host "Connect-AzAccount may require you to select a subscription and tenant, but this script will handle that independently."
     
     exit 1
+}
+
+if ($All -and ($ParameterFile -or $AllRunState)) {
+    throw '-All cannot be combined with a single parameter file or internal run state.'
 }
 
 # Check if the script is running as Administrator (Windows) or root (Linux/macOS).
@@ -116,6 +128,45 @@ if ($missingModules.Count -gt 0) {
     }
 }
 
+if ($All) {
+    $configurationPaths = @('MDC_Params.json', 'MCSB_Params.json', 'MDC_RiskBased_Params.json') | ForEach-Object { Join-Path $PSScriptRoot $_ }
+    $outputNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($configurationPath in $configurationPaths) {
+        $configuration = Get-Content -LiteralPath $configurationPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if (-not $configuration.QueryFile -or -not $configuration.CSVFileName) { throw "Missing query or output filename in $configurationPath" }
+        $expectedMode = if ([IO.Path]::GetFileName($configurationPath) -eq 'MDC_RiskBased_Params.json') { 'RiskBased' } else { 'Findings' }
+        $configuredMode = if ($configuration.Mode) { [string]$configuration.Mode } else { 'Findings' }
+        if ($configuredMode -ine $expectedMode) { throw "Expected $expectedMode mode in $configurationPath" }
+        $queryFiles = @($configuration.QueryFile)
+        $csvNames = @($configuration.CSVFileName)
+        if ($configuredMode -ieq 'RiskBased') {
+            $queryFiles += $(if ($configuration.AttackPathsQueryFile) { $configuration.AttackPathsQueryFile } else { 'MDC_AttackPaths.kql' })
+            $csvNames += $(if ($configuration.AttackPathsCSVFileName) { $configuration.AttackPathsCSVFileName } else { 'Export_MDC_AttackPaths.csv' })
+        }
+        foreach ($queryFile in $queryFiles) {
+            $queryPath = if ([IO.Path]::IsPathRooted($queryFile)) { $queryFile } else { Join-Path (Split-Path $configurationPath -Parent) $queryFile }
+            if (-not (Test-Path -LiteralPath $queryPath -PathType Leaf)) { throw "Query file not found: $queryPath" }
+        }
+        foreach ($csvName in $csvNames) {
+            if (-not $outputNames.Add([IO.Path]::GetFileNameWithoutExtension($csvName))) { throw 'All export output filenames must have different base names.' }
+        }
+    }
+    $batchState = @{ Context=$null; Timestamp=$null; OutputDirectory=(Get-Location).ProviderPath; Step=0; Total=$configurationPaths.Count }
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Stop'
+        foreach ($configurationPath in $configurationPaths) {
+            $batchState.Step++
+            $global:LASTEXITCODE = 0
+            & $PSCommandPath -ParameterFile $configurationPath -CloudEnvironment $CloudEnvironment -AllRunState $batchState
+            if ($LASTEXITCODE -ne 0) { throw "Export failed for $configurationPath (exit code $LASTEXITCODE)." }
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    return
+}
+
 # Ensure parameter file exists
 if (-Not (Test-Path $ParameterFile)) {
     Write-Host "Error: Parameter file '$ParameterFile' not found!" -ForegroundColor Red
@@ -135,6 +186,18 @@ $parameters = Get-Content -Path $ParameterFile | ConvertFrom-Json
 # ----------------------------------------------------------------------------
 $Mode = if ($parameters.Mode) { [string]$parameters.Mode } else { 'Findings' }
 $IsEntitlements = $Mode -match '(?i)^entitlement'
+$IsRiskBased = $Mode -ieq 'RiskBased'
+$riskExportColumns = $null
+if ($IsRiskBased) {
+    $riskExportColumns = @(
+        'assessmentId', 'maturityLevel', 'statusChangeDate', 'riskLevel', 'isContextualRisk',
+        'riskFactors', 'attackPaths', 'statusCode', 'displayName', 'resourceId', 'assessmentKey',
+        'resourceType', 'resourceName', 'severity', 'assessmentTypeSkimmed', 'isSubAssessment',
+        'isPreview', 'recommendationCategory', 'recommendationStatusTags', 'recommendationManagementSources',
+        'dueDate', 'owner', 'governanceStatus', 'completionStatusNumber', 'completionStatus',
+        'subscriptionId', 'subscriptionName', 'azurePortalRecommendationLink', 'description', 'remediationSteps', 'attackPathIds'
+    )
+}
 
 # Extract and validate required parameters (findings pipeline only; the
 # entitlements path uses its own output-file settings, validated later).
@@ -216,7 +279,24 @@ if ($Parallel -and -not $IsEntitlements) {
 # Read the KQL Query (findings pipeline only; the entitlements path has no KQL file)
 $kqlQuery = $null
 if (-not $IsEntitlements) {
-    $kqlQuery = Get-Content -Path $parameters.QueryFile -Raw -Encoding UTF8
+    $queryPath = $parameters.QueryFile
+    if (($IsRiskBased -or $AllRunState) -and -not [System.IO.Path]::IsPathRooted($queryPath)) {
+        $queryPath = Join-Path (Split-Path (Get-Item -LiteralPath $ParameterFile).FullName -Parent) $queryPath
+    }
+    $kqlQuery = Get-Content -LiteralPath $queryPath -Raw -Encoding UTF8
+}
+
+$attackPathQuery = $null
+if ($IsRiskBased) {
+    $attackPathQueryFile = if ($parameters.AttackPathsQueryFile) { [string]$parameters.AttackPathsQueryFile } else { Join-Path $PSScriptRoot 'MDC_AttackPaths.kql' }
+    if (-not [System.IO.Path]::IsPathRooted($attackPathQueryFile)) {
+        $attackPathQueryFile = Join-Path (Split-Path (Get-Item -LiteralPath $ParameterFile).FullName -Parent) $attackPathQueryFile
+    }
+    $attackPathQuery = Get-Content -LiteralPath $attackPathQueryFile -Raw -Encoding UTF8 -ErrorAction Stop
+    $attackPathCSVFileName = if ($parameters.AttackPathsCSVFileName) { [string]$parameters.AttackPathsCSVFileName } else { 'Export_MDC_AttackPaths.csv' }
+    if ([System.IO.Path]::GetFileNameWithoutExtension($attackPathCSVFileName) -ieq [System.IO.Path]::GetFileNameWithoutExtension($parameters.CSVFileName)) {
+        throw 'Recommendation and attack-path output filenames must have different base names.'
+    }
 }
 
 # Suppress warnings and errors during authentication
@@ -226,10 +306,17 @@ Update-AzConfig -LoginExperienceV2 Off -DisplayBreakingChangeWarning $false -War
 # Check if user is already authenticated
 $existingContext = Get-AzContext
 
+if ($AllRunState -and $AllRunState.Context) {
+    $expectedContext = $AllRunState.Context
+    if (-not $existingContext -or [string]$existingContext.Account -ine $expectedContext.Account -or [string]$existingContext.Tenant.Id -ine $expectedContext.TenantId -or [string]$existingContext.Environment.ResourceManagerUrl -ine $expectedContext.ResourceManagerUrl) {
+        throw 'Azure context changed during the all-export run. No further export was started.'
+    }
+}
+
 if ($existingContext) {
     Write-Host "You are currently authenticated as: $($existingContext.Account) | Tenant: $(Get-AzTenant | Where-Object { $_.Id -eq $existingContext.Tenant.Id } | Select-Object -ExpandProperty Name) ($($existingContext.Tenant.Id))" -ForegroundColor Cyan
 
-    $response = Read-Host "Do you want to continue with this session? (Y/N)"
+    $response = if ($AllRunState -and $AllRunState.Context) { 'Y' } else { Read-Host "Do you want to continue with this session? (Y/N)" }
 
     if ($response -match "^[Nn]$") {
         Disconnect-AzAccount -ErrorAction SilentlyContinue *>$null  
@@ -349,6 +436,19 @@ $tenantName = (Get-AzTenant -WarningAction SilentlyContinue | Where-Object { $_.
 
 Write-Host "Current tenant: $tenantName ($tenantId)" -ForegroundColor Cyan
 
+if ($AllRunState) {
+    $currentContext = Get-AzContext
+    $currentIdentity = [pscustomobject]@{
+        Account=[string]$currentContext.Account
+        TenantId=[string]$currentContext.Tenant.Id
+        ResourceManagerUrl=[string]$currentContext.Environment.ResourceManagerUrl
+    }
+    if ($AllRunState.Context -and ($currentIdentity.Account -ine $AllRunState.Context.Account -or $currentIdentity.TenantId -ine $AllRunState.Context.TenantId -or $currentIdentity.ResourceManagerUrl -ine $AllRunState.Context.ResourceManagerUrl)) {
+        throw 'Azure identity changed during authentication. No further export was started.'
+    }
+    $AllRunState.Context = $currentIdentity
+}
+
 # Retrieve subscriptions for the selected tenant
 if ($parameters.SubscriptionIds -contains '*') {
     Write-Host "Retrieving available subscriptions for the selected tenant ($tenantId)..."
@@ -376,8 +476,46 @@ if ($parameters.SubscriptionIds -contains '*') {
 # Failures are non-fatal: on any error we fall back to querying every input
 # subscription (existing behavior).
 # ============================================================================
+$exportLabel = if ($IsRiskBased) { 'Risk-based recommendations + attack paths' }
+    elseif ($IsEntitlements) { 'Entitlements' }
+    elseif ([IO.Path]::GetFileName([string]$parameters.QueryFile) -match '^MCSB') { 'Regulatory compliance - MCSB' }
+    else { 'Classic recommendations' }
+$exportStep = if ($AllRunState -and $AllRunState.Step) { ' {0}/{1}' -f $AllRunState.Step, $AllRunState.Total } else { '' }
+Write-Host ''
+Write-Host ('=== Export{0}: {1} ({2}) ===' -f $exportStep, $exportLabel, [IO.Path]::GetFileName($ParameterFile)) -ForegroundColor Cyan
 $AllInputSubscriptionIds  = @($SubscriptionIds)
 $totalInputSubscriptions  = $AllInputSubscriptionIds.Count
+if ($IsRiskBased) {
+    foreach ($inputSubscriptionId in $AllInputSubscriptionIds) {
+        $parsedSubscriptionId = [guid]::Empty
+        if (-not [guid]::TryParse([string]$inputSubscriptionId, [ref]$parsedSubscriptionId)) {
+            throw "Invalid subscription ID for risk-based export: $inputSubscriptionId"
+        }
+    }
+    $portalBaseUrl = if ($CloudEnvironment -eq 'AzureUSGovernment') { 'https://portal.azure.us' } else { 'https://portal.azure.com' }
+    $policyScope = [uri]::EscapeDataString((ConvertTo-Json -InputObject $AllInputSubscriptionIds -Compress))
+    $kqlQuery = $kqlQuery.Replace('__ESA_PORTAL_BASE_URL__', $portalBaseUrl).Replace('__ESA_POLICY_SCOPE__', $policyScope)
+    if ($attackPathQuery) { $attackPathQuery = $attackPathQuery.Replace('__ESA_PORTAL_BASE_URL__', $portalBaseUrl) }
+    Write-Host "Risk-based export: querying requested subscriptions" -ForegroundColor Cyan
+}
+$subsDefenderCspm       = @()
+$subsNoDefenderCspm     = @()  # Defender CSPM plan not enabled (or not visible); still queried, risk level is 'Not evaluated'
+$riskPreflightSucceeded = $false
+if ($IsRiskBased -and $totalInputSubscriptions -gt 0) {
+    Write-Host ("Pre-flight: checking Defender CSPM on {0} subscription(s)..." -f $totalInputSubscriptions) -ForegroundColor Cyan
+    try {
+        $rc = Search-AzGraph -Subscription $AllInputSubscriptionIds -Query "securityresources | where type == 'microsoft.security/pricings' and name =~ 'CloudPosture' and tostring(properties.pricingTier) =~ 'Standard' | distinct subscriptionId" -First 1000 -ErrorAction Stop
+        $cspmIds = if ($rc.PSObject.Properties.Name -contains 'Data') { @(@($rc.Data).subscriptionId) } else { @(@($rc).subscriptionId) }
+        $subsDefenderCspm   = @($AllInputSubscriptionIds | Where-Object { $_ -in $cspmIds })
+        $subsNoDefenderCspm = @($AllInputSubscriptionIds | Where-Object { $_ -notin $cspmIds })
+        $riskPreflightSucceeded = $true
+        Write-Host ("  Defender CSPM enabled:                     {0}" -f $subsDefenderCspm.Count) -ForegroundColor Green
+        if ($subsNoDefenderCspm.Count -gt 0) { Write-Host ("  Defender CSPM not enabled, still queried:  {0} (risk level 'Not evaluated', no attack paths)" -f $subsNoDefenderCspm.Count) -ForegroundColor Yellow }
+    } catch {
+        Write-Host ("Pre-flight failed; Defender CSPM status unknown, all {0} subscription(s) are queried. Reason: {1}" -f $totalInputSubscriptions, $_.Exception.Message) -ForegroundColor Yellow
+    }
+    Write-Host ""
+}
 $subsMcsbNotEnabled       = @()  # securityresources visible but no ascScore (MCSB compliance standard not assigned)
 $subsNoSecurityVisibility = @()  # zero securityresources visible (Defender Foundational CSPM not enabled on the sub)
 $subsNoSubscriptionAccess = @()  # subscription not visible at ARM at all (no RBAC)
@@ -387,7 +525,7 @@ $preflightSucceeded       = $false
 # restricts the query loop to MCSB-enabled subscriptions. It is intentionally
 # SKIPPED in entitlements mode: the plans/licensing export wants every visible
 # subscription (a Free-tier plan is exactly the data we are capturing).
-if ($totalInputSubscriptions -gt 0 -and -not $IsEntitlements) {
+if ($totalInputSubscriptions -gt 0 -and -not $IsEntitlements -and -not $IsRiskBased) {
     Write-Host ""
     Write-Host ("Pre-flight: classifying {0} subscription(s)..." -f $totalInputSubscriptions) -ForegroundColor Cyan
     $preflightStartTime = Get-Date
@@ -415,7 +553,7 @@ if ($totalInputSubscriptions -gt 0 -and -not $IsEntitlements) {
         $preflightDuration  = ((Get-Date) - $preflightStartTime).TotalSeconds
         $preflightSucceeded = $true
         Write-Host ("Pre-flight complete in {0:N1}s" -f $preflightDuration) -ForegroundColor DarkGray
-        Write-Host ("  MCSB enabled, will query:                  {0}" -f $subsMcsbEnabled.Count) -ForegroundColor Green
+        Write-Host ("  Subscriptions with Secure Score data, will query: {0}" -f $subsMcsbEnabled.Count) -ForegroundColor Green
         if ($subsMcsbNotEnabled.Count       -gt 0) { Write-Host ("  MCSB not assigned, skipped:                {0}" -f $subsMcsbNotEnabled.Count)       -ForegroundColor Yellow }
         if ($subsNoSecurityVisibility.Count -gt 0) { Write-Host ("  Defender Foundational CSPM not enabled:    {0}" -f $subsNoSecurityVisibility.Count) -ForegroundColor Yellow }
         if ($subsNoSubscriptionAccess.Count -gt 0) { Write-Host ("  No access (pre-flight), skipped:           {0}" -f $subsNoSubscriptionAccess.Count) -ForegroundColor Red }
@@ -429,13 +567,22 @@ if ($totalInputSubscriptions -gt 0 -and -not $IsEntitlements) {
 }
 
 # Define file names
-$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+if ($AllRunState -and -not $AllRunState.Timestamp) { $AllRunState.Timestamp = Get-Date -Format "yyyyMMdd_HHmmss" }
+$Timestamp = if ($AllRunState) { $AllRunState.Timestamp } else { Get-Date -Format "yyyyMMdd_HHmmss" }
 $BaseFileName = [System.IO.Path]::GetFileNameWithoutExtension($parameters.CSVFileName)
 $FileExtension = [System.IO.Path]::GetExtension($parameters.CSVFileName)
 $TempOutputFile = "$BaseFileName`_$Timestamp.incomplete"        # Temporary file used while the script is running
 $FinalOutputFile = "$BaseFileName`_$Timestamp$FileExtension"    # Final output file for Power BI import
 $FailedSubscriptionsFile = "$BaseFileName`_$Timestamp.failed"   # Log file containing failed subscriptions and errors
 $ReportFile = "$BaseFileName`_$Timestamp.report.txt"            # Auto-generated end-of-run summary report
+
+if ($IsRiskBased -or $AllRunState) {
+    $outputDirectory = if ($AllRunState) { $AllRunState.OutputDirectory } else { (Get-Location).ProviderPath }
+    $TempOutputFile = Join-Path $outputDirectory $TempOutputFile
+    $FinalOutputFile = Join-Path $outputDirectory $FinalOutputFile
+    $FailedSubscriptionsFile = Join-Path $outputDirectory $FailedSubscriptionsFile
+    $ReportFile = Join-Path $outputDirectory $ReportFile
+}
 
 $PageSize = 1000 # Maximum allowed value is 1000. Do not change!
 $SubscriptionCount = 0
@@ -455,7 +602,7 @@ $subsNoSecureScore      = @()
 $subsSecureScoreFailed  = @()
 
 # Delete all .incomplete files before starting a new export
-$incompleteFiles = Get-ChildItem -Path $PSScriptRoot -Filter "*.incomplete"
+$incompleteFiles = if (-not $IsRiskBased -and -not $AllRunState) { Get-ChildItem -Path $PSScriptRoot -Filter "*.incomplete" } else { @() }
 
 if ($incompleteFiles) {
     Write-Host "Deleting all previous .incomplete files..." -ForegroundColor Yellow
@@ -1039,6 +1186,45 @@ securityresources
 | where subscriptionSecureScore > 0
 | project subscriptionSecureScore, subscriptionId
 '@
+if ($IsRiskBased) { $secureScoreQuery = $null }
+$exportDefinitions = @([pscustomobject]@{ Query=$kqlQuery; Columns=$riskExportColumns; IsAttackPath=$false })
+if ($IsRiskBased) {
+    $attackPathColumns = @(
+        'attackPathId', 'attackPathResourceId', 'subscriptionId', 'subscriptionName', 'azurePortalAttackPathLink', 'displayName',
+        'attackPathType', 'riskLevel', 'isPartialAttackPath', 'description',
+        'entryPointId', 'entryPointName', 'entryPointType', 'entryPointResourceId',
+        'targetId', 'targetName', 'targetType', 'targetResourceId',
+        'attackStory', 'manualRemediationSteps', 'attackPathVersion', 'refreshInterval',
+        'graphComponentJson', 'recommendationsJson', 'attackPathStepsJson',
+        'mitreTacticsAndTechniquesJson', 'riskFactorsJson', 'entryPointJson', 'targetJson', 'recommendationCategoriesJson'
+    )
+    $exportDefinitions += [pscustomobject]@{ Query=$attackPathQuery; Columns=$attackPathColumns; IsAttackPath=$true }
+}
+
+foreach ($exportDefinition in $exportDefinitions) {
+$IsAttackPathExport = $exportDefinition.IsAttackPath
+$kqlQuery = $exportDefinition.Query
+$riskExportColumns = $exportDefinition.Columns
+$exportStartTime = $StartTime
+$queryOperationName = 'Recommendation query'
+if ($IsAttackPathExport) {
+    $exportStartTime = Get-Date
+    $queryOperationName = 'Attack path query'
+    $BaseFileName = [System.IO.Path]::GetFileNameWithoutExtension($attackPathCSVFileName)
+    $FileExtension = [System.IO.Path]::GetExtension($attackPathCSVFileName)
+    $TempOutputFile = Join-Path $outputDirectory "$BaseFileName`_$Timestamp.incomplete"
+    $FinalOutputFile = Join-Path $outputDirectory "$BaseFileName`_$Timestamp$FileExtension"
+    $FailedSubscriptionsFile = Join-Path $outputDirectory "$BaseFileName`_$Timestamp.failed"
+    $ReportFile = Join-Path $outputDirectory "$BaseFileName`_$Timestamp.report.txt"
+    Write-Host 'Attack paths: querying requested subscriptions' -ForegroundColor Cyan
+}
+$subsSuccessful = @()
+$subsNoData = @()
+$subsPermissionFail = @()
+$subsOtherFail = @()
+$subsWithSecureScore = @()
+$subsSecureScoreFailed = @()
+$subsNoSecureScore = @()
 $totalRecordsQuery = "$kqlQuery | summarize totalRecords = count()"
 
 $workItems = for ($i = 0; $i -lt $SubscriptionIds.Count; $i++) {
@@ -1249,7 +1435,7 @@ try {
         $workerScript = {
             param(
                 $work, $sharedContext, $kql, $ssQuery, $countQuery,
-                $pageSize, $runTempDir, $progress
+                $pageSize, $runTempDir, $progress, $exportColumns, $queryOperationName
             )
 
             # Belt-and-suspenders: explicitly set the Az context in this worker's
@@ -1293,18 +1479,20 @@ try {
                 try { $progress.WorkerStatus[$subscriptionIndex] = $label }
                 finally { [System.Threading.Monitor]::Exit($progress.SyncRoot) }
             }
-            & $setStatus 'secscore'
+            if ($ssQuery) { & $setStatus 'secscore' }
 
             # Secure score (best-effort). Track outcome so the end-of-run
             # summary can distinguish 'no securescores resource' from 'query
             # failed' - both leave $secureScore = $null otherwise.
             $secureScoreError = $null
             try {
-                $ssResult = Invoke-WorkerSearchAzGraph -SubscriptionId $subscriptionId -Query $ssQuery -First 1 -OperationName "Secure score query" -OutputBuffer $outputBuffer
-                if ($ssResult.Succeeded -and $ssResult.Result.Count -gt 0 -and $ssResult.Result[0].subscriptionSecureScore) {
-                    $secureScore = [double]$ssResult.Result[0].subscriptionSecureScore
-                } elseif (-not $ssResult.Succeeded) {
-                    $secureScoreError = $ssResult.ErrorMessage
+                if ($ssQuery) {
+                    $ssResult = Invoke-WorkerSearchAzGraph -SubscriptionId $subscriptionId -Query $ssQuery -First 1 -OperationName "Secure score query" -OutputBuffer $outputBuffer
+                    if ($ssResult.Succeeded -and $ssResult.Result.Count -gt 0 -and $ssResult.Result[0].subscriptionSecureScore) {
+                        $secureScore = [double]$ssResult.Result[0].subscriptionSecureScore
+                    } elseif (-not $ssResult.Succeeded) {
+                        $secureScoreError = $ssResult.ErrorMessage
+                    }
                 }
             } catch {
                 $secureScoreError = $_.Exception.Message
@@ -1327,7 +1515,7 @@ try {
             while ($true) {
                 $currentPage++
                 & $setStatus ("page {0}/{1}" -f $currentPage, $totalPages)
-                $pageResult = Invoke-WorkerSearchAzGraph -SubscriptionId $subscriptionId -Query $kql -First $pageSize -Skip $skip -OperationName "Recommendation query" -OutputBuffer $outputBuffer
+                $pageResult = Invoke-WorkerSearchAzGraph -SubscriptionId $subscriptionId -Query $kql -First $pageSize -Skip $skip -OperationName $queryOperationName -OutputBuffer $outputBuffer
                 & $drainBuffer
                 if (-not $pageResult.Succeeded) {
                     & $emitLine "Warning: Error executing query for subscription $subscriptionId"
@@ -1349,6 +1537,8 @@ try {
                         $_.Value = $_.Value.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
                     }
                     $_
+                } | ForEach-Object {
+                    if ($exportColumns) { $_ | Select-Object -Property $exportColumns } else { $_ }
                 } | Export-Csv -Path $csvFragment -NoTypeInformation -Append
 
                 $retrievedRecords += $batchCount
@@ -1387,7 +1577,7 @@ try {
             Start-ThreadJob -ThrottleLimit $ParallelWorkers `
                 -InitializationScript $initScript `
                 -ScriptBlock $workerScript `
-                -ArgumentList @($work, $sharedContext, $kqlQuery, $secureScoreQuery, $totalRecordsQuery, $PageSize, $RunTempDirectory, $progressState)
+                -ArgumentList @($work, $sharedContext, $kqlQuery, $secureScoreQuery, $totalRecordsQuery, $PageSize, $RunTempDirectory, $progressState, $riskExportColumns, $queryOperationName)
         }
 
         # Drain output live while jobs run.
@@ -1498,11 +1688,13 @@ try {
             # failed' - both leave $secureScore = $null otherwise.
             $secureScoreError = $null
             try {
-                $ssResult = Invoke-SearchAzGraphWithRetry -SubscriptionId $SubscriptionId -Query $secureScoreQuery -First 1 -OperationName "Secure score query"
-                if ($ssResult.Succeeded -and $ssResult.Result.Count -gt 0 -and $ssResult.Result[0].subscriptionSecureScore) {
-                    $secureScore = [double]$ssResult.Result[0].subscriptionSecureScore
-                } elseif (-not $ssResult.Succeeded) {
-                    $secureScoreError = $ssResult.ErrorMessage
+                if ($secureScoreQuery) {
+                    $ssResult = Invoke-SearchAzGraphWithRetry -SubscriptionId $SubscriptionId -Query $secureScoreQuery -First 1 -OperationName "Secure score query"
+                    if ($ssResult.Succeeded -and $ssResult.Result.Count -gt 0 -and $ssResult.Result[0].subscriptionSecureScore) {
+                        $secureScore = [double]$ssResult.Result[0].subscriptionSecureScore
+                    } elseif (-not $ssResult.Succeeded) {
+                        $secureScoreError = $ssResult.ErrorMessage
+                    }
                 }
             } catch {
                 $secureScoreError = $_.Exception.Message
@@ -1518,7 +1710,7 @@ try {
             # Page through results
             $Skip = 0
             while ($true) {
-                $pageResult = Invoke-SearchAzGraphWithRetry -SubscriptionId $SubscriptionId -Query $kqlQuery -First $PageSize -Skip $Skip -OperationName "Recommendation query"
+                $pageResult = Invoke-SearchAzGraphWithRetry -SubscriptionId $SubscriptionId -Query $kqlQuery -First $PageSize -Skip $Skip -OperationName $queryOperationName
                 if (-not $pageResult.Succeeded) {
                     Write-Host "Warning: Error executing query for subscription $SubscriptionId" -ForegroundColor Yellow
                     Add-Content -Path $FailedSubscriptionsFile -Value "Subscription ID: $SubscriptionId - Error: $($pageResult.ErrorMessage)"
@@ -1539,6 +1731,8 @@ try {
                         $_.Value = $_.Value.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
                     }
                     $_
+                } | ForEach-Object {
+                    if ($riskExportColumns) { $_ | Select-Object -Property $riskExportColumns } else { $_ }
                 } | Export-Csv -Path $TempOutputFile -NoTypeInformation -Append
 
                 $retrievedRecords += $batchCount
@@ -1586,12 +1780,14 @@ try {
         }
 
         # Secure score categorization (independent of recommendation outcome).
-        if ($null -ne $r.SecureScore) {
-            $subsWithSecureScore += $r.SubscriptionId
-        } elseif ($r.SecureScoreError) {
-            $subsSecureScoreFailed += $r.SubscriptionId
-        } else {
-            $subsNoSecureScore += $r.SubscriptionId
+        if (-not $IsRiskBased) {
+            if ($null -ne $r.SecureScore) {
+                $subsWithSecureScore += $r.SubscriptionId
+            } elseif ($r.SecureScoreError) {
+                $subsSecureScoreFailed += $r.SubscriptionId
+            } else {
+                $subsNoSecureScore += $r.SubscriptionId
+            }
         }
     }
 
@@ -1599,10 +1795,16 @@ try {
     if ($secureScoresList.Count -gt 0) {
         $overallSecureScore = [math]::Round(($secureScoresList | Measure-Object -Average).Average, 2)
         Write-Host ("Overall Secure Score across {0} subscriptions: {1}" -f $secureScoresList.Count, $overallSecureScore) -ForegroundColor Green
-    } else {
+    } elseif (-not $IsRiskBased) {
         Write-Host "No Secure Score data found across subscriptions." -ForegroundColor Yellow
     }
     Write-Host ""
+
+    if ($IsRiskBased -and -not (Test-Path $TempOutputFile) -and $subsPermissionFail.Count -eq 0 -and $subsOtherFail.Count -eq 0) {
+        $emptyExportRow = [ordered]@{}
+        foreach ($columnName in $riskExportColumns) { $emptyExportRow[$columnName] = $null }
+        [pscustomobject]$emptyExportRow | ConvertTo-Csv -NoTypeInformation | Select-Object -First 1 | Set-Content -LiteralPath $TempOutputFile -Encoding UTF8
+    }
 
     if (Test-Path $TempOutputFile) {
         Move-Item -Path $TempOutputFile -Destination $FinalOutputFile -Force
@@ -1629,44 +1831,31 @@ try {
 }
 
 $EndTime = Get-Date
-$Duration = $EndTime - $StartTime
+$Duration = $EndTime - $exportStartTime
 $durationFormatted = "{0:D1}h {1:D2}m {2:D2}s" -f $Duration.Hours, $Duration.Minutes, $Duration.Seconds
 
 # ----------------------------------------------------------------------------
 # EXPORT SUMMARY
 # ----------------------------------------------------------------------------
 $separator = ('=' * 60)
-Write-Host ""
-Write-Host $separator -ForegroundColor Cyan
-Write-Host " EXPORT SUMMARY" -ForegroundColor Cyan
-Write-Host $separator -ForegroundColor Cyan
-Write-Host ""
+$summaryRows = @()
 if ($preflightSucceeded -and $totalInputSubscriptions -gt 0) {
-    Write-Host ("{0,-50}{1}" -f "Total input subscriptions:", $totalInputSubscriptions)
-    Write-Host ("{0,-50}{1}" -f "Subscriptions queried (MCSB enabled):", $SubscriptionCount)
+    $summaryRows += [pscustomobject]@{ Label='Total input subscriptions:'; Value=$totalInputSubscriptions; Color='White' }
+    $summaryRows += [pscustomobject]@{ Label='Subscriptions queried (Secure Score data):'; Value=$SubscriptionCount; Color='White' }
 } else {
-    Write-Host ("{0,-50}{1}" -f "Total subscriptions queried:", $SubscriptionCount)
+    $summaryRows += [pscustomobject]@{ Label='Total subscriptions queried:'; Value=$SubscriptionCount; Color='White' }
 }
-Write-Host ("{0,-50}{1}" -f "Subscriptions with data:", $subsSuccessful.Count) -ForegroundColor Green
-if ($subsNoData.Count -gt 0) {
-    Write-Host ("{0,-50}{1}" -f "Subscriptions with no data (DfC gap):", $subsNoData.Count) -ForegroundColor Yellow
-}
-if ($subsPermissionFail.Count -gt 0) {
-    Write-Host ("{0,-50}{1}" -f "Failed - access denied (per-query):", $subsPermissionFail.Count) -ForegroundColor Red
-}
-if ($subsOtherFail.Count -gt 0) {
-    Write-Host ("{0,-50}{1}" -f "Subscriptions failed (other errors):", $subsOtherFail.Count) -ForegroundColor Red
-}
+$summaryRows += [pscustomobject]@{ Label='Subscriptions with data:'; Value=$subsSuccessful.Count; Color='Green' }
+$summaryRows += [pscustomobject]@{ Label='Subscriptions with no data:'; Value=$subsNoData.Count; Color=$(if ($subsNoData.Count) { 'Yellow' } else { 'Gray' }) }
+$summaryRows += [pscustomobject]@{ Label='Failed - access denied (per-query):'; Value=$subsPermissionFail.Count; Color=$(if ($subsPermissionFail.Count) { 'Red' } else { 'Gray' }) }
+$summaryRows += [pscustomobject]@{ Label='Subscriptions failed (other errors):'; Value=$subsOtherFail.Count; Color=$(if ($subsOtherFail.Count) { 'Red' } else { 'Gray' }) }
 if ($preflightSucceeded) {
-    if ($subsMcsbNotEnabled.Count -gt 0) {
-        Write-Host ("{0,-50}{1}" -f "Skipped - MCSB not assigned:", $subsMcsbNotEnabled.Count) -ForegroundColor Yellow
-    }
-    if ($subsNoSecurityVisibility.Count -gt 0) {
-        Write-Host ("{0,-50}{1}" -f "Skipped - Defender Foundational CSPM not enabled:", $subsNoSecurityVisibility.Count) -ForegroundColor Yellow
-    }
-    if ($subsNoSubscriptionAccess.Count -gt 0) {
-        Write-Host ("{0,-50}{1}" -f "Skipped - no access (pre-flight):", $subsNoSubscriptionAccess.Count) -ForegroundColor Red
-    }
+    $summaryRows += [pscustomobject]@{ Label='Skipped - MCSB not assigned:'; Value=$subsMcsbNotEnabled.Count; Color=$(if ($subsMcsbNotEnabled.Count) { 'Yellow' } else { 'Gray' }) }
+    $summaryRows += [pscustomobject]@{ Label='Skipped - Defender Foundational CSPM not enabled:'; Value=$subsNoSecurityVisibility.Count; Color=$(if ($subsNoSecurityVisibility.Count) { 'Yellow' } else { 'Gray' }) }
+    $summaryRows += [pscustomobject]@{ Label='Skipped - no access (pre-flight):'; Value=$subsNoSubscriptionAccess.Count; Color=$(if ($subsNoSubscriptionAccess.Count) { 'Red' } else { 'Gray' }) }
+}
+if ($riskPreflightSucceeded) {
+    $summaryRows += [pscustomobject]@{ Label='Defender CSPM not enabled (still queried):'; Value=$subsNoDefenderCspm.Count; Color=$(if ($subsNoDefenderCspm.Count) { 'Yellow' } else { 'Gray' }) }
 }
 # Secure-score visibility: surface the X-of-Y rate explicitly so a 1-of-87 case
 # does not get presented as a tenant-wide average.
@@ -1674,11 +1863,25 @@ $ssReturnedCount = $subsWithSecureScore.Count
 $ssColor = if ($ssReturnedCount -eq $SubscriptionCount -and $SubscriptionCount -gt 0) { 'Green' }
            elseif ($ssReturnedCount -gt 0) { 'Yellow' }
            else { 'Red' }
-Write-Host ("{0,-50}{1} of {2} subscriptions" -f "Secure score returned:", $ssReturnedCount, $SubscriptionCount) -ForegroundColor $ssColor
-if ($subsSecureScoreFailed.Count -gt 0) {
-    Write-Host ("{0,-50}{1}" -f "Secure score query failed:", $subsSecureScoreFailed.Count) -ForegroundColor Red
+if (-not $IsRiskBased) {
+    $summaryRows += [pscustomobject]@{ Label='Secure score returned:'; Value=("{0} of {1} subscriptions" -f $ssReturnedCount, $SubscriptionCount); Color=$ssColor }
 }
-Write-Host ("{0,-50}{1}" -f "Script execution time:", $durationFormatted)
+if ($subsSecureScoreFailed.Count -gt 0) {
+    $summaryRows += [pscustomobject]@{ Label='Secure score query failed:'; Value=$subsSecureScoreFailed.Count; Color='Red' }
+}
+if (Test-Path $FinalOutputFile) {
+    $summaryRows += [pscustomobject]@{ Label='Output file:'; Value=$FinalOutputFile; Color='White' }
+    $summaryRows += [pscustomobject]@{ Label='Output size:'; Value=(Get-FormattedFileSize -Bytes (Get-Item $FinalOutputFile).Length); Color='White' }
+}
+$summaryRows += [pscustomobject]@{ Label='Script execution time:'; Value=$durationFormatted; Color='White' }
+Write-Host ""
+Write-Host $separator -ForegroundColor Cyan
+Write-Host " EXPORT SUMMARY" -ForegroundColor Cyan
+Write-Host $separator -ForegroundColor Cyan
+Write-Host ""
+foreach ($summaryRow in $summaryRows) {
+    Write-Host ("{0,-50}{1}" -f $summaryRow.Label, $summaryRow.Value) -ForegroundColor $summaryRow.Color
+}
 Write-Host ""
 
 # ----------------------------------------------------------------------------
@@ -1695,28 +1898,18 @@ try {
     $reportLines += ("  User:           {0}" -f (Get-AzContext).Account)
     $reportLines += ("  Tenant:         {0} ({1})" -f $tenantName, $tenantId)
     $reportLines += ("  Parameter File: {0}" -f $ParameterFile)
+    if ($IsAttackPathExport) {
+        $reportLines += '  Export mode:    AttackPaths'
+    } elseif ($IsRiskBased) {
+        $reportLines += "  Export mode:    RiskBased"
+        $reportLines += "  Contextual risk requires Defender CSPM; Not evaluated is not Low risk."
+        $reportLines += "  Secure Score is not collected for this export."
+    }
     $reportLines += ""
     $reportLines += "EXPORT SUMMARY"
-    if ($preflightSucceeded -and $totalInputSubscriptions -gt 0) {
-        $reportLines += ("  {0,-50}{1}" -f "Total input subscriptions:", $totalInputSubscriptions)
-        $reportLines += ("  {0,-50}{1}" -f "Queried (MCSB enabled):", $SubscriptionCount)
-    } else {
-        $reportLines += ("  {0,-50}{1}" -f "Subscriptions queried:", $SubscriptionCount)
+    foreach ($summaryRow in $summaryRows) {
+        $reportLines += ("  {0,-50}{1}" -f $summaryRow.Label, $summaryRow.Value)
     }
-    $reportLines += ("  {0,-50}{1}" -f "Subscriptions with data:", $subsSuccessful.Count)
-    $reportLines += ("  {0,-50}{1}" -f "Subscriptions with no data:", $subsNoData.Count)
-    $reportLines += ("  {0,-50}{1}" -f "Failed - access denied (per-query):", $subsPermissionFail.Count)
-    $reportLines += ("  {0,-50}{1}" -f "Failed - other errors:", $subsOtherFail.Count)
-    if ($preflightSucceeded) {
-        $reportLines += ("  {0,-50}{1}" -f "Skipped - MCSB not assigned:", $subsMcsbNotEnabled.Count)
-        $reportLines += ("  {0,-50}{1}" -f "Skipped - Defender Foundational CSPM not enabled:", $subsNoSecurityVisibility.Count)
-        $reportLines += ("  {0,-50}{1}" -f "Skipped - no access (pre-flight):", $subsNoSubscriptionAccess.Count)
-    }
-    if (Test-Path $FinalOutputFile) {
-        $reportLines += ("  {0,-50}{1}" -f "Output file:", $FinalOutputFile)
-        $reportLines += ("  {0,-50}{1}" -f "Output size:", (Get-FormattedFileSize -Bytes (Get-Item $FinalOutputFile).Length))
-    }
-    $reportLines += ("  {0,-50}{1}" -f "Duration:", $durationFormatted)
     $reportLines += ""
     if ($secureScoresList.Count -gt 0) {
         $reportLines += "SECURE SCORE"
@@ -1728,7 +1921,7 @@ try {
             }
         }
         $reportLines += ""
-    } elseif ($SubscriptionCount -gt 0) {
+    } elseif ($SubscriptionCount -gt 0 -and -not $IsRiskBased) {
         $reportLines += "SECURE SCORE"
         $reportLines += ("  No subscription returned a Defender for Cloud secure score (0 of {0})." -f $SubscriptionCount)
         $reportLines += "  This typically means MDC is not enabled on the queried subscriptions."
@@ -1746,8 +1939,15 @@ try {
     }
     if ($subsNoData.Count -gt 0) {
         $reportLines += "SUBSCRIPTIONS WITH NO DATA"
-        $reportLines += "  No 'microsoft.security/assessments' rows returned. Typically MDC is not"
-        $reportLines += "  enabled on these subscriptions, or there are no Azure resources to evaluate."
+        if ($IsAttackPathExport) {
+            $reportLines += '  No attack paths returned.'
+        } elseif ($IsRiskBased) {
+            $reportLines += "  No portal-supported assessments matched the query. This alone does not"
+            $reportLines += "  establish whether Defender CSPM is enabled or whether resources are healthy."
+        } else {
+            $reportLines += "  No 'microsoft.security/assessments' rows returned. Typically MDC is not"
+            $reportLines += "  enabled on these subscriptions, or there are no Azure resources to evaluate."
+        }
         foreach ($subId in $subsNoData) { $reportLines += "  - $subId" }
         $reportLines += ""
     }
@@ -1762,11 +1962,16 @@ try {
     }
     if ($subsPermissionFail.Count -gt 0) {
         $reportLines += "SUBSCRIPTIONS FAILED - ACCESS DENIED (PER-QUERY)"
-        $reportLines += "  These subscriptions passed pre-flight (visible at ARM) but the per-sub"
-        $reportLines += "  Search-AzGraph call returned AuthorizationFailed / Forbidden / AccessDenied."
-        $reportLines += "  This is rare. Likely causes: RBAC removed mid-run, token refresh failure"
-        $reportLines += "  during a long run, or the subscription state changed (disabled / moved"
-        $reportLines += "  to another tenant) between pre-flight and the per-sub query."
+        if ($IsRiskBased) {
+            $reportLines += "  Search-AzGraph returned AuthorizationFailed / Forbidden / AccessDenied"
+            $reportLines += "  for a requested subscription. The classic pre-flight gate was not used."
+        } else {
+            $reportLines += "  These subscriptions passed pre-flight (visible at ARM) but the per-sub"
+            $reportLines += "  Search-AzGraph call returned AuthorizationFailed / Forbidden / AccessDenied."
+            $reportLines += "  This is rare. Likely causes: RBAC removed mid-run, token refresh failure"
+            $reportLines += "  during a long run, or the subscription state changed (disabled / moved"
+            $reportLines += "  to another tenant) between pre-flight and the per-sub query."
+        }
         $reportLines += "  Action: re-run the export. If it persists, verify the running identity"
         $reportLines += "  still has Reader on these subs."
         foreach ($subId in $subsPermissionFail) { $reportLines += "  - $subId" }
@@ -1813,8 +2018,25 @@ try {
         foreach ($subId in $subsNoSubscriptionAccess) { $reportLines += "  - $subId" }
         $reportLines += ""
     }
+    if ($riskPreflightSucceeded -and $subsNoDefenderCspm.Count -gt 0) {
+        $reportLines += "SUBSCRIPTIONS WITHOUT DEFENDER CSPM (STILL QUERIED)"
+        $reportLines += "  The Defender CSPM plan is not enabled on these subscriptions (or its plan"
+        $reportLines += "  setting is not visible to the running identity)."
+        if ($IsAttackPathExport) {
+            $reportLines += "  Attack path analysis requires Defender CSPM, so no attack paths are"
+            $reportLines += "  expected for them."
+        } else {
+            $reportLines += "  Their recommendations are exported with risk level 'Not evaluated',"
+            $reportLines += "  which is not Low risk: contextual risk requires Defender CSPM."
+        }
+        $reportLines += "  Action: enable the Defender CSPM plan on these subscriptions to get risk"
+        $reportLines += "  levels and attack paths. See https://learn.microsoft.com/azure/defender-for-cloud/tutorial-enable-cspm-plan"
+        foreach ($subId in $subsNoDefenderCspm) { $reportLines += "  - $subId" }
+        $reportLines += ""
+    }
     $hasPreflightGap = $preflightSucceeded -and ($subsMcsbNotEnabled.Count -gt 0 -or $subsNoSecurityVisibility.Count -gt 0 -or $subsNoSubscriptionAccess.Count -gt 0)
-    if ($subsNoData.Count -gt 0 -or $subsPermissionFail.Count -gt 0 -or $hasPreflightGap) {
+    if ($riskPreflightSucceeded -and $subsNoDefenderCspm.Count -gt 0) { $hasPreflightGap = $true }
+    if (($subsNoData.Count -gt 0 -and -not $IsAttackPathExport) -or $subsPermissionFail.Count -gt 0 -or $hasPreflightGap) {
         $reportLines += "NEXT STEPS"
         $reportLines += "  - Engage the CSA to remediate the gaps listed above before continuing."
         $reportLines += "  - Or proceed with the ESA based on the current data quality."
@@ -1832,9 +2054,10 @@ try {
     $reportLines += "  XDR and Purview data must be exported manually."
     $reportLines | Out-File -FilePath $ReportFile -Encoding UTF8
     Write-Host ("Export report saved: {0}" -f $ReportFile) -ForegroundColor Green
-    if ($subsNoData.Count -gt 0 -or $subsPermissionFail.Count -gt 0 -or $subsOtherFail.Count -gt 0 -or $subsSecureScoreFailed.Count -gt 0 -or ($preflightSucceeded -and ($subsMcsbNotEnabled.Count -gt 0 -or $subsNoSecurityVisibility.Count -gt 0 -or $subsNoSubscriptionAccess.Count -gt 0))) {
+    if (($subsNoData.Count -gt 0 -and -not $IsAttackPathExport) -or $subsPermissionFail.Count -gt 0 -or $subsOtherFail.Count -gt 0 -or $subsSecureScoreFailed.Count -gt 0 -or $hasPreflightGap) {
         Write-Host ("ATTENTION: Data quality gaps detected. See report file {0} for details." -f $ReportFile) -ForegroundColor Yellow
     }
 } catch {
     Write-Host ("Warning: failed to write report file: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+}
 }

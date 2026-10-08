@@ -1,0 +1,98 @@
+securityresources
+| where type =~ "microsoft.security/assessments"
+| where properties.metadata.assessmentType in~ ("BuiltIn", "CustomerManaged", "BuiltInPolicy")
+| extend recommendationCategory = tostring(properties.metadata.recommendationCategory),
+    riskLevelText = tostring(properties.risk.level),
+    severity = tostring(properties.metadata.severity),
+    isContextualRisk = iff(isnull(properties.risk.isContextualRisk), false, tobool(properties.risk.isContextualRisk))
+| extend riskRank = case(riskLevelText =~ "Critical", 4, riskLevelText =~ "High", 3, riskLevelText =~ "Medium", 2, riskLevelText =~ "Low", 1, 0)
+| extend riskRank = iff(isContextualRisk, riskRank, 0)
+| extend assessmentTypeSkimmed = case(
+    tostring(properties.metadata.assessmentType) == "BuiltIn", "BuiltIn",
+    tostring(properties.metadata.assessmentType) == "BuiltInPolicy", "BuiltIn",
+    tostring(properties.metadata.assessmentType) == "CustomerManaged", "Custom", "")
+| extend assessmentId = tolower(id), assessmentKey = name,
+    source = trim(' ', tolower(coalesce(tostring(properties.resourceDetails.Source), tostring(properties.resourceDetails.source)))),
+    statusCode = tostring(properties.status.code)
+| extend resourceId = tolower(trim(" ", tostring(case(
+    source =~ "azure", coalesce(properties.resourceDetails.Id, properties.resourceDetails.id),
+    source =~ "aws" and isnotempty(tostring(properties.resourceDetails.ConnectorId)), coalesce(properties.resourceDetails.Id, properties.resourceDetails.id),
+    source =~ "gcp" and isnotempty(tostring(properties.resourceDetails.ConnectorId)), coalesce(properties.resourceDetails.Id, properties.resourceDetails.id),
+    source =~ "aws", properties.resourceDetails.AzureResourceId,
+    source =~ "gcp", properties.resourceDetails.AzureResourceId,
+    split(id, "/providers/Microsoft.Security/assessments/")[0]))))
+| extend resourceName = tostring(coalesce(properties.resourceDetails.ResourceName, properties.resourceDetails.resourceName, properties.additionalData.CloudNativeResourceName, properties.additionalData.ResourceName, properties.additionalData.resourceName, split(resourceId, '/')[-1])),
+    resourceType = tolower(coalesce(properties.resourceDetails.ResourceType, properties.resourceDetails.resourceType)),
+    riskFactors = iff(isnull(properties.risk.riskFactors), dynamic([]), properties.risk.riskFactors),
+    attackPaths = array_length(iff(isnull(properties.risk.attackPathsReferences), dynamic([]), properties.risk.attackPathsReferences)),
+    attackPathIds = tostring(iff(isnull(properties.risk.attackPathsReferences), dynamic([]), properties.risk.attackPathsReferences)),
+    displayName = tostring(properties.displayName),
+    isExempt = tostring(properties.status.cause) == "Exempt",
+    statusChangeDate = tostring(todatetime(properties.status.statusChangeDate)),
+    isSubAssessment = isnotempty(todynamic(properties.additionalData)["subAssessmentsLink"]),
+    isPreview = iff(isnull(properties.metadata.preview), false, tobool(properties.metadata.preview)),
+    gaPublishDate = tostring(properties.metadata.publishDates.ga),
+    description = tostring(properties.metadata.description),
+    remediationSteps = tostring(properties.metadata.remediationDescription)
+| extend gaPublishDateParsed = iff(isempty(gaPublishDate), datetime(null), todatetime(strcat(substring(gaPublishDate, 6, 4), "-", substring(gaPublishDate, 0, 2), "-", substring(gaPublishDate, 3, 2))))
+| extend isNew = isPreview != true and isnotnull(gaPublishDateParsed) and gaPublishDateParsed >= ago(30d) and gaPublishDateParsed <= now()
+| extend recommendationStatusTags = array_sort_asc(set_difference(pack_array(
+    iff(isPreview, "preview", ""),
+    iff(isnotempty(recommendationCategory) and recommendationCategory !~ "Unknown", "newVersion", ""),
+    iff(isSubAssessment, "setForDeprecation", ""),
+    iff(isNew, "new", "")), dynamic([""])))
+| extend recommendationManagementSources = tostring(coalesce(properties.additionalData.RecommendationManagementSources, properties.additionalData.recommendationManagementSources)),
+    maturityLevel = iff(isPreview, "Preview", "GA")
+| project assessmentId, maturityLevel, statusChangeDate, isExempt, riskRank, isContextualRisk,
+    riskFactors, attackPaths, statusCode, displayName, resourceId, assessmentKey, resourceType,
+    resourceName, severity, assessmentTypeSkimmed, isSubAssessment, isPreview, recommendationCategory,
+    recommendationStatusTags, recommendationManagementSources, subscriptionId, description, remediationSteps, attackPathIds
+| join kind=leftouter (
+    securityresources
+    | where type =~ "microsoft.security/assessments/governanceassignments"
+    | extend assignedResourceId = tolower(tostring(properties.assignedResourceId)),
+        dueDate = todatetime(properties.remediationDueDate),
+        owner = iff(isempty(tostring(properties.owner)), "unspecified", tostring(properties.owner))
+    | extend governanceStatus = case(isnull(dueDate), "NoDueDate", dueDate >= bin(now(), 1d), "OnTime", "Overdue")
+    | project assignedResourceId, dueDate, owner, governanceStatus
+) on $left.assessmentId == $right.assignedResourceId
+| extend completionStatusNumber = case(statusCode == "Healthy", 1, governanceStatus == "Overdue", 5, governanceStatus == "OnTime", 4, statusCode == "Unhealthy", 3, isExempt, 7, 1)
+| extend completionStatus = case(completionStatusNumber == 5, "Overdue", completionStatusNumber == 4, "OnTime", completionStatusNumber == 3, "Unassigned", completionStatusNumber == 7, "Exempted", "Completed")
+| join kind=leftouter (
+    resourcecontainers
+    | where type =~ "microsoft.resources/subscriptions"
+    | project subscriptionId, subscriptionName = name
+) on subscriptionId
+| extend dd = strcat(9-riskRank, iff(riskFactors has_cs "Critical Resource", 0, 1), 9-array_length(riskFactors), displayName)
+| sort by dd asc, assessmentId asc, dueDate asc, owner asc, governanceStatus asc
+| project assessmentId,
+    maturityLevel,
+    statusChangeDate,
+    riskLevel = case(riskRank == 4, "Critical", riskRank == 3, "High", riskRank == 2, "Medium", riskRank == 1, "Low", "Not evaluated"),
+    isContextualRisk = toint(isContextualRisk),
+    riskFactors = iff(array_length(riskFactors) == 0, "", strcat("'", strcat_array(riskFactors, "','"), "'")),
+    attackPaths,
+    statusCode,
+    displayName,
+    resourceId,
+    assessmentKey,
+    resourceType,
+    resourceName,
+    severity,
+    assessmentTypeSkimmed,
+    isSubAssessment = toint(isSubAssessment),
+    isPreview = toint(isPreview),
+    recommendationCategory,
+    recommendationStatusTags = iff(array_length(recommendationStatusTags) == 0, "", strcat("'", strcat_array(recommendationStatusTags, "','"), "'")),
+    recommendationManagementSources,
+    dueDate = tostring(dueDate),
+    owner,
+    governanceStatus,
+    completionStatusNumber,
+    completionStatus,
+    subscriptionId,
+    subscriptionName = iff(isempty(subscriptionName), subscriptionId, subscriptionName),
+    azurePortalRecommendationLink = strcat("__ESA_PORTAL_BASE_URL__/#view/Microsoft_Azure_Security/Recommendation.ReactView/assessedResourceId/", url_encode_component(assessmentId), "/recommendationDisplayName/", url_encode_component(displayName), "/policySourceSubscriptionIds~/__ESA_POLICY_SCOPE__"),
+    description,
+    remediationSteps,
+    attackPathIds

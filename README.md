@@ -1,19 +1,23 @@
 # Enterprise Security Assessment – Data Gathering Script
 
-This repository contains the necessary files for collecting security and compliance data as part of an Enterprise Security Assessment (ESA). The included scripts and configuration files are used to extract Defender for Cloud recommendations for both:
+This repository contains the necessary files for collecting security and compliance data as part of an Enterprise Security Assessment (ESA). The included scripts and configuration files are used to extract Defender for Cloud recommendations for:
 
 - **MDC (Microsoft Defender for Cloud Secure Score Recommendations)**
+- **MDC risk-based recommendations and attack paths (Defender CSPM)**
 - **MCSB (Microsoft Cloud Security Benchmark – Regulatory Compliance)**
 
 ## Contents
 
 | Filename                | Purpose                                                                 |
 |-------------------------|-------------------------------------------------------------------------|
-| ESA_MDC_DataExport.ps1  | PowerShell script that downloads Defender for Cloud recommendations (MCSB regulatory compliance and MDC Secure Score recommendations.) |
+| ESA_MDC_DataExport.ps1  | PowerShell script that downloads Defender for Cloud recommendations (MCSB regulatory compliance, MDC Secure Score recommendations and MDC risk-based recommendations.) |
 | MDC_Params.json         | Parameter file containing export settings for MDC.                      |
+| MDC_RiskBased_Params.json | Parameter file containing export settings for the MDC risk-based recommendations and attack paths. |
 | MCSB_Params.json        | Parameter file containing export settings for MCSB.                     |
 | Entitlements_Params.json| Parameter file for the optional entitlements export (Defender for Cloud plans + Microsoft 365 license inventory). |
 | MDC.kql                 | The KQL (Kusto Query Language) query executed by the script for MDC.    |
+| MDC_RiskBased.kql       | The KQL query executed by the script for the MDC risk-based recommendations. |
+| MDC_AttackPaths.kql     | The KQL query executed by the script for the MDC attack paths.          |
 | MCSB.kql                | The KQL (Kusto Query Language) query executed by the script for MCSB.   |
 
 
@@ -43,15 +47,19 @@ To run the script, pass the path to a JSON parameter file:
 .\ESA_MDC_DataExport.ps1 <ParameterFile>
 
 .\ESA_MDC_DataExport.ps1 MDC_Params.json
+.\ESA_MDC_DataExport.ps1 MDC_RiskBased_Params.json
 .\ESA_MDC_DataExport.ps1 MCSB_Params.json
 .\ESA_MDC_DataExport.ps1 Entitlements_Params.json
+.\ESA_MDC_DataExport.ps1 -All
 .\ESA_MDC_DataExport.ps1 -CloudEnvironment AzureUSGovernment MDC_Params.json
 .\ESA_MDC_DataExport.ps1 -CloudEnvironment AzureUSGovernment MCSB_Params.json
 ```
 
 If you run the script without any parameters, a help message will be displayed.
 
-To export both MDC and MCSB data, run the script twice - once with each parameter file.
+To export MDC, MCSB and the risk-based recommendations, run the script once with each parameter file, or run it once with `-All`. `-All` runs `MDC_Params.json`, `MCSB_Params.json` and `MDC_RiskBased_Params.json` one after the other with a single sign-in, and writes all files with the same timestamp to the current folder. It does not include the entitlements export.
+
+**Risk-based export:** `MDC_RiskBased_Params.json` exports the Defender for Cloud risk-based recommendations (`Export_MDC_RiskBased_Recommendations_<timestamp>.csv`) and the related attack paths (`Export_MDC_AttackPaths_<timestamp>.csv`). Risk levels and attack paths require the **Defender CSPM** plan; recommendations of subscriptions without it are exported with the risk level `Not evaluated`. Before querying, the script checks which subscriptions have Defender CSPM enabled. All subscriptions are queried; those without Defender CSPM are listed in the summary and the report.
 
 **Optional entitlements export:** Run the script a third time with `Entitlements_Params.json` to capture licensing context in two CSV files:
 
@@ -169,6 +177,46 @@ This JSON file defines input parameters for the `ESA_MDC_DataExport.ps1` script 
 | `Parallel`         | Default `false` (serial). Set to `true` to query subscriptions in parallel for faster runs on large tenants - the script auto-sizes the worker pool. **EXPERIMENTAL** and requires **PowerShell 7+** plus the `ThreadJob` module (the script will offer to install it if missing). Not supported on Windows PowerShell 5.1.      |
 | `RemediationUrls`  | Optional. Array of `{Label, Url}` entries shown in the CSA remediation guidance block (and the report file) when data quality gaps are detected. Leave empty to suppress the reference list.                                                                                              |
 
+# Script Parameter File: `MDC_RiskBased_Params.json`
+
+This JSON file defines input parameters for the `ESA_MDC_DataExport.ps1` script when exporting **MDC risk-based recommendations and attack paths**.
+
+```json
+{
+    "Mode": "RiskBased",
+    "CSVFileName": "Export_MDC_RiskBased_Recommendations.csv",
+    "QueryFile": "MDC_RiskBased.kql",
+    "AttackPathsCSVFileName": "Export_MDC_AttackPaths.csv",
+    "AttackPathsQueryFile": "MDC_AttackPaths.kql",
+    "SubscriptionIds": ["*"],
+    "Parallel": false,
+    "RemediationUrls": [
+        { "Label": "Defender for Cloud risk prioritization", "Url": "https://learn.microsoft.com/azure/defender-for-cloud/risk-prioritization" }
+    ],
+    "_comments": {
+        "Mode": "RiskBased. Do not change!",
+        "CSVFileName": "Final CSV output file for Power BI import",
+        "QueryFile": "KQL Query file. Do not change!",
+        "AttackPathsCSVFileName": "Final CSV output file with the attack paths for Power BI import",
+        "AttackPathsQueryFile": "KQL Query file for the attack paths. Do not change!",
+        "SubscriptionIds": "Comma-separated subscription IDs or '*' for all available subscriptions. If you specify specific subscriptions, ensure you connect to the correct tenant (if you have access to multiple tenants) during script execution. If you don't have access to some subscriptions, the script will continue with the remaining ones.",
+        "Parallel": "Default false. Set to true to query subscriptions in parallel for faster runs on large tenants - the script auto-sizes the worker pool. EXPERIMENTAL: requires PowerShell 7+ AND the 'ThreadJob' module (the script will offer to install it).",
+        "RemediationUrls": "Optional. Links shown in the CSA remediation guidance block (and the report file) when data quality gaps are detected. Each entry needs a Label and a Url. Leave the array empty to suppress the reference list."
+    }
+}
+```
+
+| **Parameter**            | **Description**                                                                                                                                       |
+|--------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `Mode`                   | Must be `"RiskBased"` to run this export.                                                                                                             |
+| `CSVFileName`            | The name of the file containing the exported risk-based recommendations. This file needs to be imported into the Power BI report. Keep the default value. |
+| `QueryFile`              | The file containing the KQL query for the recommendations. **Do not modify.**                                                                         |
+| `AttackPathsCSVFileName` | The name of the file containing the exported attack paths. It is written with the same timestamp and imported into the Power BI report together with the recommendations. Keep the default value. |
+| `AttackPathsQueryFile`   | The file containing the KQL query for the attack paths. **Do not modify.**                                                                            |
+| `SubscriptionIds`        | Same as for `MDC_Params.json`.                                                                                                                         |
+| `Parallel`               | Same as for `MDC_Params.json`.                                                                                                                         |
+| `RemediationUrls`        | Same as for `MDC_Params.json`.                                                                                                                         |
+
 # Script Parameter File: `Entitlements_Params.json`
 
 This JSON file drives the **optional entitlements export** (`"Mode": "Entitlements"`). Instead of the recommendation-findings pipeline, the script exports two licensing files that make the ESA roadmap's licensing guidance precise (owned vs. buy vs. enable-a-Defender-plan).
@@ -186,7 +234,7 @@ This JSON file drives the **optional entitlements export** (`"Mode": "Entitlemen
 
 | **Parameter**                 | **Description**                                                                                                                                                                             |
 |-------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `Mode`                        | Must be `"Entitlements"` to run this export path. Any other value (or omitting it) runs the standard MDC/MCSB findings export.                                                              |
+| `Mode`                        | Must be `"Entitlements"` to run this export path. Omitting it runs the standard MDC/MCSB findings export.                                                                                  |
 | `DefenderPlansCSVFileName`    | Base name for the Defender for Cloud plans CSV; a timestamp is appended automatically. Columns: `PlanName, SubPlan, PricingTier, Enabled, Scope` (`Scope` = subscription ID).              |
 | `LicenseInventoryCSVFileName` | Base name for the Microsoft 365 license inventory CSV; a timestamp is appended automatically. Columns: `SkuPartNumber, ProductName, AssignedUnits, Owned`.                                 |
 | `SubscriptionIds`             | `'*'` for all subscriptions in the selected tenant, or an explicit list. Defender plans are read from every listed subscription; the license inventory is tenant-wide regardless.          |
@@ -202,34 +250,18 @@ This JSON file drives the **optional entitlements export** (`"Mode": "Entitlemen
 - [MCSB_Params.json](https://github.com/microsoft/ESA/blob/main/src/MCSB_Params.json)
 - [MDC.kql](https://github.com/microsoft/ESA/blob/main/src/MDC.kql)
 - [MDC_Params.json](https://github.com/microsoft/ESA/blob/main/src/MDC_Params.json)
+- [MDC_RiskBased.kql](https://github.com/microsoft/ESA/blob/main/src/MDC_RiskBased.kql)
+- [MDC_AttackPaths.kql](https://github.com/microsoft/ESA/blob/main/src/MDC_AttackPaths.kql)
+- [MDC_RiskBased_Params.json](https://github.com/microsoft/ESA/blob/main/src/MDC_RiskBased_Params.json)
 - [Entitlements_Params.json](https://github.com/microsoft/ESA/blob/main/src/Entitlements_Params.json)
+- [README.md](https://github.com/microsoft/ESA/blob/main/README.md)
 
 ### 📥 Download All Files via PowerShell
 
-To download all files listed above automatically, run the following script:
+To download all files listed above into the current folder, paste the following line into a PowerShell terminal:
 
 ```powershell
-param(    
-    [Parameter()][string]
-    $Branch = "main"
-)
-
-$baseURL = "https://raw.githubusercontent.com/microsoft/ESA/$Branch/src"
-
-$workingDirectory = (Get-Location).Path
-Write-Host "Working Directory: $workingDirectory"
-
-Invoke-WebRequest "$baseURL/files-list.txt" -OutFile "$workingDirectory\files-list.txt"
-
-Write-Host "Downloading from: $baseURL"
-Write-Host "We will get these files:"
-Get-Content "$workingDirectory\files-list.txt" | ForEach-Object { Write-Host "   $_" }
-
-# Download each file in the list
-Get-Content "$workingDirectory\files-list.txt" | ForEach-Object {
-    $fileName = $_
-    Invoke-WebRequest "$baseURL/$fileName" -OutFile "$workingDirectory\$fileName"
-}
+$b='https://raw.githubusercontent.com/microsoft/ESA/main'; (Invoke-RestMethod "$b/src/files-list.txt") -split '\r?\n' | Where-Object { $_ } | ForEach-Object { Invoke-WebRequest "$b/src/$_" -OutFile $_ -UseBasicParsing }; Invoke-WebRequest "$b/README.md" -OutFile README.md -UseBasicParsing
 ```
 
 # Trademarks
