@@ -49,6 +49,29 @@ if ($All -and ($ParameterFile -or $AllRunState)) {
     throw '-All cannot be combined with a single parameter file or internal run state.'
 }
 
+$languageMode = $ExecutionContext.SessionState.LanguageMode
+if ($languageMode -notin @('FullLanguage', 'ConstrainedLanguage')) {
+    throw "Unsupported PowerShell language mode: $languageMode"
+}
+if ($languageMode -eq 'ConstrainedLanguage' -and $PSVersionTable.PSVersion.Major -lt 7) {
+    throw 'ConstrainedLanguage export requires PowerShell 7 or later.'
+}
+
+function Get-ExportFileName {
+    param([string]$Path)
+    return ($Path -split '[\\/]')[-1]
+}
+
+function Get-ExportBaseName {
+    param([string]$Path)
+    return ((Get-ExportFileName $Path) -replace '\.[^.]*$', '')
+}
+
+function Test-ExportPathRooted {
+    param([string]$Path)
+    return $Path -match '^(?:[A-Za-z]:|[\\/])'
+}
+
 # Check if the script is running as Administrator (Windows) or root (Linux/macOS).
 # On non-Windows PowerShell Core the Windows-only IsInRole check silently returns
 # $false, so root execution would slip through without an explicit platform branch
@@ -56,6 +79,15 @@ if ($All -and ($ParameterFile -or $AllRunState)) {
 if ($IsLinux -or $IsMacOS) {
     if ([int](id -u) -eq 0) {
         Write-Host "Error: This script must NOT be run as root!" -ForegroundColor Red
+        exit 1
+    }
+} elseif ($languageMode -eq 'ConstrainedLanguage') {
+    $groups = & (Join-Path $env:SystemRoot 'System32\whoami.exe') /groups /fo csv /nh
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to determine Windows elevation status.' }
+    $integrity = [regex]::Match(($groups -join "`n"), 'S-1-16-(\d+)')
+    if (-not $integrity.Success) { throw 'Windows integrity level was not returned; elevation check failed.' }
+    if ([int]$integrity.Groups[1].Value -ge 12288) {
+        Write-Host "Error: This script must NOT be run as Administrator!" -ForegroundColor Red
         exit 1
     }
 } else {
@@ -69,11 +101,7 @@ if ($IsLinux -or $IsMacOS) {
     }
 }
 
-# Check FullLanguage mode (constrained language mode breaks several Az cmdlets we rely on)
-if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
-    Write-Host "Error: PowerShell must run in FullLanguage mode. Current mode: $($ExecutionContext.SessionState.LanguageMode)" -ForegroundColor Red
-    exit 1
-}
+Write-Host "PowerShell language mode: $languageMode"
 
 # Check not running in Azure Cloud Shell (unsupported environment)
 if ($env:AZUREPS_HOST_ENVIRONMENT -match 'cloud-shell' -or $env:ACC_CLOUD -eq 'true') {
@@ -130,11 +158,11 @@ if ($missingModules.Count -gt 0) {
 
 if ($All) {
     $configurationPaths = @('MDC_Params.json', 'MCSB_Params.json', 'MDC_RiskBased_Params.json') | ForEach-Object { Join-Path $PSScriptRoot $_ }
-    $outputNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $outputNames = @{}
     foreach ($configurationPath in $configurationPaths) {
         $configuration = Get-Content -LiteralPath $configurationPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         if (-not $configuration.QueryFile -or -not $configuration.CSVFileName) { throw "Missing query or output filename in $configurationPath" }
-        $expectedMode = if ([IO.Path]::GetFileName($configurationPath) -eq 'MDC_RiskBased_Params.json') { 'RiskBased' } else { 'Findings' }
+        $expectedMode = if ((Get-ExportFileName $configurationPath) -eq 'MDC_RiskBased_Params.json') { 'RiskBased' } else { 'Findings' }
         $configuredMode = if ($configuration.Mode) { [string]$configuration.Mode } else { 'Findings' }
         if ($configuredMode -ine $expectedMode) { throw "Expected $expectedMode mode in $configurationPath" }
         $queryFiles = @($configuration.QueryFile)
@@ -144,11 +172,13 @@ if ($All) {
             $csvNames += $(if ($configuration.AttackPathsCSVFileName) { $configuration.AttackPathsCSVFileName } else { 'Export_MDC_AttackPaths.csv' })
         }
         foreach ($queryFile in $queryFiles) {
-            $queryPath = if ([IO.Path]::IsPathRooted($queryFile)) { $queryFile } else { Join-Path (Split-Path $configurationPath -Parent) $queryFile }
+            $queryPath = if (Test-ExportPathRooted $queryFile) { $queryFile } else { Join-Path (Split-Path $configurationPath -Parent) $queryFile }
             if (-not (Test-Path -LiteralPath $queryPath -PathType Leaf)) { throw "Query file not found: $queryPath" }
         }
         foreach ($csvName in $csvNames) {
-            if (-not $outputNames.Add([IO.Path]::GetFileNameWithoutExtension($csvName))) { throw 'All export output filenames must have different base names.' }
+            $outputName = Get-ExportBaseName $csvName
+            if ($outputNames.ContainsKey($outputName)) { throw 'All export output filenames must have different base names.' }
+            $outputNames[$outputName] = $true
         }
     }
     $batchState = @{ Context=$null; Timestamp=$null; OutputDirectory=(Get-Location).ProviderPath; Step=0; Total=$configurationPaths.Count }
@@ -230,6 +260,10 @@ if ($null -ne $parameters.Parallel) {
 # $ParallelWorkers is computed later (after sub list is built). Default = 1 (serial).
 $ParallelWorkers = 1
 
+if ($Parallel -and $languageMode -eq 'ConstrainedLanguage') {
+    throw 'Parallel export requires FullLanguage mode. Set Parallel to false for ConstrainedLanguage mode.'
+}
+
 # PS7 + ThreadJob prerequisites. Run when parallel mode is requested.
 # Parallel mode applies only to the findings pipeline; the entitlements export
 # is a couple of batched queries and never needs the worker pool.
@@ -280,7 +314,7 @@ if ($Parallel -and -not $IsEntitlements) {
 $kqlQuery = $null
 if (-not $IsEntitlements) {
     $queryPath = $parameters.QueryFile
-    if (($IsRiskBased -or $AllRunState) -and -not [System.IO.Path]::IsPathRooted($queryPath)) {
+    if (($IsRiskBased -or $AllRunState) -and -not (Test-ExportPathRooted $queryPath)) {
         $queryPath = Join-Path (Split-Path (Get-Item -LiteralPath $ParameterFile).FullName -Parent) $queryPath
     }
     $kqlQuery = Get-Content -LiteralPath $queryPath -Raw -Encoding UTF8
@@ -289,12 +323,12 @@ if (-not $IsEntitlements) {
 $attackPathQuery = $null
 if ($IsRiskBased) {
     $attackPathQueryFile = if ($parameters.AttackPathsQueryFile) { [string]$parameters.AttackPathsQueryFile } else { Join-Path $PSScriptRoot 'MDC_AttackPaths.kql' }
-    if (-not [System.IO.Path]::IsPathRooted($attackPathQueryFile)) {
+    if (-not (Test-ExportPathRooted $attackPathQueryFile)) {
         $attackPathQueryFile = Join-Path (Split-Path (Get-Item -LiteralPath $ParameterFile).FullName -Parent) $attackPathQueryFile
     }
     $attackPathQuery = Get-Content -LiteralPath $attackPathQueryFile -Raw -Encoding UTF8 -ErrorAction Stop
     $attackPathCSVFileName = if ($parameters.AttackPathsCSVFileName) { [string]$parameters.AttackPathsCSVFileName } else { 'Export_MDC_AttackPaths.csv' }
-    if ([System.IO.Path]::GetFileNameWithoutExtension($attackPathCSVFileName) -ieq [System.IO.Path]::GetFileNameWithoutExtension($parameters.CSVFileName)) {
+    if ((Get-ExportBaseName $attackPathCSVFileName) -ieq (Get-ExportBaseName $parameters.CSVFileName)) {
         throw 'Recommendation and attack-path output filenames must have different base names.'
     }
 }
@@ -438,7 +472,7 @@ Write-Host "Current tenant: $tenantName ($tenantId)" -ForegroundColor Cyan
 
 if ($AllRunState) {
     $currentContext = Get-AzContext
-    $currentIdentity = [pscustomobject]@{
+    $currentIdentity = [ordered]@{
         Account=[string]$currentContext.Account
         TenantId=[string]$currentContext.Tenant.Id
         ResourceManagerUrl=[string]$currentContext.Environment.ResourceManagerUrl
@@ -478,17 +512,16 @@ if ($parameters.SubscriptionIds -contains '*') {
 # ============================================================================
 $exportLabel = if ($IsRiskBased) { 'Risk-based recommendations + attack paths' }
     elseif ($IsEntitlements) { 'Entitlements' }
-    elseif ([IO.Path]::GetFileName([string]$parameters.QueryFile) -match '^MCSB') { 'Regulatory compliance - MCSB' }
+    elseif ((Get-ExportFileName ([string]$parameters.QueryFile)) -match '^MCSB') { 'Regulatory compliance - MCSB' }
     else { 'Classic recommendations' }
 $exportStep = if ($AllRunState -and $AllRunState.Step) { ' {0}/{1}' -f $AllRunState.Step, $AllRunState.Total } else { '' }
 Write-Host ''
-Write-Host ('=== Export{0}: {1} ({2}) ===' -f $exportStep, $exportLabel, [IO.Path]::GetFileName($ParameterFile)) -ForegroundColor Cyan
+Write-Host ('=== Export{0}: {1} ({2}) ===' -f $exportStep, $exportLabel, (Get-ExportFileName $ParameterFile)) -ForegroundColor Cyan
 $AllInputSubscriptionIds  = @($SubscriptionIds)
 $totalInputSubscriptions  = $AllInputSubscriptionIds.Count
 if ($IsRiskBased) {
     foreach ($inputSubscriptionId in $AllInputSubscriptionIds) {
-        $parsedSubscriptionId = [guid]::Empty
-        if (-not [guid]::TryParse([string]$inputSubscriptionId, [ref]$parsedSubscriptionId)) {
+        try { $null = [guid][string]$inputSubscriptionId } catch {
             throw "Invalid subscription ID for risk-based export: $inputSubscriptionId"
         }
     }
@@ -569,8 +602,8 @@ if ($totalInputSubscriptions -gt 0 -and -not $IsEntitlements -and -not $IsRiskBa
 # Define file names
 if ($AllRunState -and -not $AllRunState.Timestamp) { $AllRunState.Timestamp = Get-Date -Format "yyyyMMdd_HHmmss" }
 $Timestamp = if ($AllRunState) { $AllRunState.Timestamp } else { Get-Date -Format "yyyyMMdd_HHmmss" }
-$BaseFileName = [System.IO.Path]::GetFileNameWithoutExtension($parameters.CSVFileName)
-$FileExtension = [System.IO.Path]::GetExtension($parameters.CSVFileName)
+$BaseFileName = Get-ExportBaseName $parameters.CSVFileName
+$FileExtension = (Get-ExportFileName $parameters.CSVFileName).Substring($BaseFileName.Length)
 $TempOutputFile = "$BaseFileName`_$Timestamp.incomplete"        # Temporary file used while the script is running
 $FinalOutputFile = "$BaseFileName`_$Timestamp$FileExtension"    # Final output file for Power BI import
 $FailedSubscriptionsFile = "$BaseFileName`_$Timestamp.failed"   # Log file containing failed subscriptions and errors
@@ -695,7 +728,7 @@ function Invoke-SearchAzGraphWithRetry {
             } else {
                 @($response)
             }
-            return [pscustomobject]@{
+            return [ordered]@{
                 Succeeded    = $true
                 Result       = $result
                 ErrorMessage = $null
@@ -711,7 +744,7 @@ function Invoke-SearchAzGraphWithRetry {
             $retryLimit   = if ($isRateLimited) { $RateLimitMaxRetries } else { $MaxRetries }
 
             if (-not $isRetriable -or $retryCount -ge $retryLimit) {
-                return [pscustomobject]@{
+                return [ordered]@{
                     Succeeded    = $false
                     Result       = @()
                     ErrorMessage = $errorMessage
@@ -723,7 +756,9 @@ function Invoke-SearchAzGraphWithRetry {
             $backoffDelay = if ($isRateLimited) {
                 $RateLimitRetryDelaySeconds * $retryCount
             } else {
-                [math]::Pow(2, $retryCount) * $RetryDelaySeconds
+                $multiplier = 1
+                for ($exponent = 0; $exponent -lt $retryCount; $exponent++) { $multiplier *= 2 }
+                $multiplier * $RetryDelaySeconds
             }
             $reason = if ([string]::IsNullOrWhiteSpace($errorCode)) { "Unknown" } else { $errorCode }
             # Skip the first rate-limit warning - the first retry almost always
@@ -882,11 +917,13 @@ securityresources
           pricingTier = tostring(properties.pricingTier)
 '@
 
-    $rows = New-Object 'System.Collections.Generic.List[object]'
+    $rows = @()
     # ARG accepts up to 1000 subscriptions per call; chunk defensively.
     $chunkSize = 1000
     for ($ci = 0; $ci -lt $SubscriptionIds.Count; $ci += $chunkSize) {
-        $chunk = $SubscriptionIds[$ci..([Math]::Min($ci + $chunkSize - 1, $SubscriptionIds.Count - 1))]
+        $lastIndex = $ci + $chunkSize - 1
+        if ($lastIndex -ge $SubscriptionIds.Count) { $lastIndex = $SubscriptionIds.Count - 1 }
+        $chunk = $SubscriptionIds[$ci..$lastIndex]
         $skip = 0
         while ($true) {
             $attempt = 0
@@ -906,7 +943,8 @@ securityresources
                     $lastError = $_
                     $attempt++
                     if ($attempt -lt $maxAttempts) {
-                        $delay = [math]::Pow(2, $attempt)
+                        $delay = 1
+                        for ($exponent = 0; $exponent -lt $attempt; $exponent++) { $delay *= 2 }
                         Write-Host ("Warning: Defender plans query failed (attempt {0}/{1}); retrying in {2}s..." -f $attempt, $maxAttempts, $delay) -ForegroundColor Yellow
                         Start-Sleep -Seconds $delay
                     }
@@ -927,13 +965,13 @@ securityresources
                 $enabled = if ($tier -match '(?i)standard') { 'Yes' }
                            elseif ($tier -match '(?i)free') { 'No' }
                            else { 'Unknown' }
-                $rows.Add([pscustomobject][ordered]@{
+                $rows += ,[ordered]@{
                     PlanName    = "$($d.planName)".Trim()
                     SubPlan     = "$($d.subPlan)".Trim()
                     PricingTier = $tier
                     Enabled     = $enabled
                     Scope       = "$($d.subscriptionId)".Trim()
-                }) | Out-Null
+                }
             }
 
             if ($data.Count -lt 1000) { break }
@@ -941,7 +979,7 @@ securityresources
         }
     }
 
-    $sorted = @($rows | Sort-Object Scope, PlanName)
+    $sorted = @($rows | Sort-Object { $_.Scope }, { $_.PlanName })
     $sorted | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
     return $sorted
 }
@@ -971,7 +1009,8 @@ function Export-EsaLicenseInventory {
     # Az.Accounts 5.x returns the token as a SecureString by default; earlier
     # versions return a plain string. Normalize to a plain bearer string.
     $access = if ($tok.Token -is [System.Security.SecureString]) {
-        [System.Net.NetworkCredential]::new('', $tok.Token).Password
+        if ($languageMode -eq 'ConstrainedLanguage') { ConvertFrom-SecureString -SecureString $tok.Token -AsPlainText }
+        else { [System.Net.NetworkCredential]::new('', $tok.Token).Password }
     } else {
         [string]$tok.Token
     }
@@ -982,7 +1021,7 @@ function Export-EsaLicenseInventory {
 
     $headers = @{ Authorization = "Bearer $access" }
     $uri = "$GraphResource/v1.0/subscribedSkus?`$select=skuId,skuPartNumber,consumedUnits,prepaidUnits,capabilityStatus,appliesTo"
-    $rows = New-Object 'System.Collections.Generic.List[object]'
+    $rows = @()
 
     while ($uri) {
         try {
@@ -1003,18 +1042,18 @@ function Export-EsaLicenseInventory {
             $prepaid = 0
             if ($s.prepaidUnits -and $null -ne $s.prepaidUnits.enabled) { $prepaid = [int]$s.prepaidUnits.enabled }
             $owned = if ($prepaid -gt 0) { 'Yes' } else { 'No' }
-            $rows.Add([pscustomobject][ordered]@{
+            $rows += ,[ordered]@{
                 SkuPartNumber = "$($s.skuPartNumber)".Trim()
                 ProductName   = Get-M365ProductName "$($s.skuPartNumber)".Trim()
                 AssignedUnits = $prepaid
                 Owned         = $owned
-            }) | Out-Null
+            }
         }
 
         $uri = if ($resp.PSObject.Properties.Name -contains '@odata.nextLink') { $resp.'@odata.nextLink' } else { $null }
     }
 
-    $sorted = @($rows | Sort-Object SkuPartNumber)
+    $sorted = @($rows | Sort-Object { $_.SkuPartNumber })
     $sorted | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
     return $sorted
 }
@@ -1028,8 +1067,8 @@ if ($IsEntitlements) {
     $graphResource = if ($CloudEnvironment -eq 'AzureUSGovernment') { 'https://graph.microsoft.us' } else { 'https://graph.microsoft.com' }
 
     # Output file names (param file may override; timestamped like the findings export).
-    $plansBaseName   = if ($parameters.DefenderPlansCSVFileName)   { [System.IO.Path]::GetFileNameWithoutExtension($parameters.DefenderPlansCSVFileName) }   else { 'Export_Defender_Plans' }
-    $licenseBaseName = if ($parameters.LicenseInventoryCSVFileName){ [System.IO.Path]::GetFileNameWithoutExtension($parameters.LicenseInventoryCSVFileName) } else { 'Export_License_Inventory' }
+    $plansBaseName   = if ($parameters.DefenderPlansCSVFileName)   { Get-ExportBaseName $parameters.DefenderPlansCSVFileName }   else { 'Export_Defender_Plans' }
+    $licenseBaseName = if ($parameters.LicenseInventoryCSVFileName){ Get-ExportBaseName $parameters.LicenseInventoryCSVFileName } else { 'Export_License_Inventory' }
     $plansOutputFile   = "$plansBaseName`_$Timestamp.csv"
     $licenseOutputFile = "$licenseBaseName`_$Timestamp.csv"
     $entReportFile     = "Entitlements_$Timestamp.report.txt"
@@ -1102,8 +1141,8 @@ if ($IsEntitlements) {
     $durationFormatted = "{0:D1}h {1:D2}m {2:D2}s" -f $Duration.Hours, $Duration.Minutes, $Duration.Seconds
 
     $planCount        = if ($planRows)    { @($planRows).Count }    else { 0 }
-    $planSubsWithStd  = if ($planRows)    { @($planRows | Where-Object { $_.Enabled -eq 'Yes' } | Select-Object -ExpandProperty Scope -Unique).Count } else { 0 }
-    $planSubsTotal    = if ($planRows)    { @($planRows | Select-Object -ExpandProperty Scope -Unique).Count } else { 0 }
+    $planSubsWithStd  = if ($planRows)    { @($planRows | Where-Object { $_.Enabled -eq 'Yes' } | ForEach-Object { $_.Scope } | Sort-Object -Unique).Count } else { 0 }
+    $planSubsTotal    = if ($planRows)    { @($planRows | ForEach-Object { $_.Scope } | Sort-Object -Unique).Count } else { 0 }
     $licCount         = if ($licenseRows) { @($licenseRows).Count } else { 0 }
     $licOwned         = if ($licenseRows) { @($licenseRows | Where-Object { $_.Owned -eq 'Yes' }).Count } else { 0 }
 
@@ -1187,7 +1226,7 @@ securityresources
 | project subscriptionSecureScore, subscriptionId
 '@
 if ($IsRiskBased) { $secureScoreQuery = $null }
-$exportDefinitions = @([pscustomobject]@{ Query=$kqlQuery; Columns=$riskExportColumns; IsAttackPath=$false })
+$exportDefinitions = @([ordered]@{ Query=$kqlQuery; Columns=$riskExportColumns; IsAttackPath=$false })
 if ($IsRiskBased) {
     $attackPathColumns = @(
         'attackPathId', 'attackPathResourceId', 'subscriptionId', 'subscriptionName', 'azurePortalAttackPathLink', 'displayName',
@@ -1198,7 +1237,7 @@ if ($IsRiskBased) {
         'graphComponentJson', 'recommendationsJson', 'attackPathStepsJson',
         'mitreTacticsAndTechniquesJson', 'riskFactorsJson', 'entryPointJson', 'targetJson', 'recommendationCategoriesJson'
     )
-    $exportDefinitions += [pscustomobject]@{ Query=$attackPathQuery; Columns=$attackPathColumns; IsAttackPath=$true }
+    $exportDefinitions += [ordered]@{ Query=$attackPathQuery; Columns=$attackPathColumns; IsAttackPath=$true }
 }
 
 foreach ($exportDefinition in $exportDefinitions) {
@@ -1210,8 +1249,8 @@ $queryOperationName = 'Recommendation query'
 if ($IsAttackPathExport) {
     $exportStartTime = Get-Date
     $queryOperationName = 'Attack path query'
-    $BaseFileName = [System.IO.Path]::GetFileNameWithoutExtension($attackPathCSVFileName)
-    $FileExtension = [System.IO.Path]::GetExtension($attackPathCSVFileName)
+    $BaseFileName = Get-ExportBaseName $attackPathCSVFileName
+    $FileExtension = (Get-ExportFileName $attackPathCSVFileName).Substring($BaseFileName.Length)
     $TempOutputFile = Join-Path $outputDirectory "$BaseFileName`_$Timestamp.incomplete"
     $FinalOutputFile = Join-Path $outputDirectory "$BaseFileName`_$Timestamp$FileExtension"
     $FailedSubscriptionsFile = Join-Path $outputDirectory "$BaseFileName`_$Timestamp.failed"
@@ -1227,12 +1266,12 @@ $subsSecureScoreFailed = @()
 $subsNoSecureScore = @()
 $totalRecordsQuery = "$kqlQuery | summarize totalRecords = count()"
 
-$workItems = for ($i = 0; $i -lt $SubscriptionIds.Count; $i++) {
-    [pscustomobject]@{
+$workItems = @(for ($i = 0; $i -lt $SubscriptionIds.Count; $i++) {
+    [ordered]@{
         Index          = $i + 1
         SubscriptionId = $SubscriptionIds[$i]
     }
-}
+})
 $TotalSubscriptions = $workItems.Count
 # Auto-size the worker pool when Parallel=true:
 #   subscriptions <= 4 -> workers = subscriptions
@@ -1533,17 +1572,19 @@ try {
                 }
 
                 $batch | ForEach-Object {
-                    $_.PSObject.Properties | Where-Object { $_.Value -is [datetime] } | ForEach-Object {
-                        $_.Value = $_.Value.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                    $exportRow = [ordered]@{}
+                    $columns = if ($exportColumns) { $exportColumns } else { @($_.PSObject.Properties.Name) }
+                    foreach ($column in $columns) {
+                        $value = $_.$column
+                        $exportRow[$column] = if ($value -is [datetime]) { $value.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") } else { $value }
                     }
-                    $_
-                } | ForEach-Object {
-                    if ($exportColumns) { $_ | Select-Object -Property $exportColumns } else { $_ }
+                    $exportRow
                 } | Export-Csv -Path $csvFragment -NoTypeInformation -Append
 
                 $retrievedRecords += $batchCount
                 $skip += $pageSize
-                $remainingRecords = [Math]::Max(0, $totalRecords - $retrievedRecords)
+                $remainingRecords = $totalRecords - $retrievedRecords
+                if ($remainingRecords -lt 0) { $remainingRecords = 0 }
                 & $emitLine "Subscription $subscriptionId - Retrieved $batchCount records, remaining: $remainingRecords"
 
                 if ($batchCount -lt $pageSize) { break }
@@ -1727,23 +1768,25 @@ try {
                 }
 
                 $batch | ForEach-Object {
-                    $_.PSObject.Properties | Where-Object { $_.Value -is [datetime] } | ForEach-Object {
-                        $_.Value = $_.Value.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                    $exportRow = [ordered]@{}
+                    $columns = if ($riskExportColumns) { $riskExportColumns } else { @($_.PSObject.Properties.Name) }
+                    foreach ($column in $columns) {
+                        $value = $_.$column
+                        $exportRow[$column] = if ($value -is [datetime]) { $value.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") } else { $value }
                     }
-                    $_
-                } | ForEach-Object {
-                    if ($riskExportColumns) { $_ | Select-Object -Property $riskExportColumns } else { $_ }
+                    $exportRow
                 } | Export-Csv -Path $TempOutputFile -NoTypeInformation -Append
 
                 $retrievedRecords += $batchCount
                 $Skip += $PageSize
-                $remainingRecords = [Math]::Max(0, $totalRecords - $retrievedRecords)
+                $remainingRecords = $totalRecords - $retrievedRecords
+                if ($remainingRecords -lt 0) { $remainingRecords = 0 }
                 Write-Host "Subscription $SubscriptionId - Retrieved $batchCount records, remaining: $remainingRecords" -ForegroundColor Green
 
                 if ($batchCount -lt $PageSize) { break }
             }
 
-            [pscustomobject]@{
+            [ordered]@{
                 SubscriptionId   = $SubscriptionId
                 Index            = $subscriptionIndex
                 SecureScore      = $secureScore
@@ -1761,7 +1804,7 @@ try {
     # ------------------------------------------------------------
 
     $SubscriptionCount = $workerResults.Count
-    $secureScoresList  = @($workerResults | Where-Object { $null -ne $_.SecureScore } | Select-Object -ExpandProperty SecureScore)
+    $secureScoresList  = @(foreach ($result in $workerResults) { if ($null -ne $result.SecureScore) { $result.SecureScore } })
 
     # Categorize each subscription's outcome for the end-of-run summary.
     # Permission errors are detected by pattern-matching the failure message;
@@ -1793,7 +1836,8 @@ try {
 
     Write-Host ""
     if ($secureScoresList.Count -gt 0) {
-        $overallSecureScore = [math]::Round(($secureScoresList | Measure-Object -Average).Average, 2)
+        $averageScore = [double]($secureScoresList | Measure-Object -Average).Average
+        $overallSecureScore = [double]$averageScore.ToString('F2', [Globalization.CultureInfo]::InvariantCulture)
         Write-Host ("Overall Secure Score across {0} subscriptions: {1}" -f $secureScoresList.Count, $overallSecureScore) -ForegroundColor Green
     } elseif (-not $IsRiskBased) {
         Write-Host "No Secure Score data found across subscriptions." -ForegroundColor Yellow
@@ -1803,7 +1847,7 @@ try {
     if ($IsRiskBased -and -not (Test-Path $TempOutputFile) -and $subsPermissionFail.Count -eq 0 -and $subsOtherFail.Count -eq 0) {
         $emptyExportRow = [ordered]@{}
         foreach ($columnName in $riskExportColumns) { $emptyExportRow[$columnName] = $null }
-        [pscustomobject]$emptyExportRow | ConvertTo-Csv -NoTypeInformation | Select-Object -First 1 | Set-Content -LiteralPath $TempOutputFile -Encoding UTF8
+        ($riskExportColumns | ForEach-Object { '"' + $_.Replace('"', '""') + '"' }) -join ',' | Set-Content -LiteralPath $TempOutputFile -Encoding UTF8
     }
 
     if (Test-Path $TempOutputFile) {
@@ -1840,22 +1884,22 @@ $durationFormatted = "{0:D1}h {1:D2}m {2:D2}s" -f $Duration.Hours, $Duration.Min
 $separator = ('=' * 60)
 $summaryRows = @()
 if ($preflightSucceeded -and $totalInputSubscriptions -gt 0) {
-    $summaryRows += [pscustomobject]@{ Label='Total input subscriptions:'; Value=$totalInputSubscriptions; Color='White' }
-    $summaryRows += [pscustomobject]@{ Label='Subscriptions queried (Secure Score data):'; Value=$SubscriptionCount; Color='White' }
+    $summaryRows += [ordered]@{ Label='Total input subscriptions:'; Value=$totalInputSubscriptions; Color='White' }
+    $summaryRows += [ordered]@{ Label='Subscriptions queried (Secure Score data):'; Value=$SubscriptionCount; Color='White' }
 } else {
-    $summaryRows += [pscustomobject]@{ Label='Total subscriptions queried:'; Value=$SubscriptionCount; Color='White' }
+    $summaryRows += [ordered]@{ Label='Total subscriptions queried:'; Value=$SubscriptionCount; Color='White' }
 }
-$summaryRows += [pscustomobject]@{ Label='Subscriptions with data:'; Value=$subsSuccessful.Count; Color='Green' }
-$summaryRows += [pscustomobject]@{ Label='Subscriptions with no data:'; Value=$subsNoData.Count; Color=$(if ($subsNoData.Count) { 'Yellow' } else { 'Gray' }) }
-$summaryRows += [pscustomobject]@{ Label='Failed - access denied (per-query):'; Value=$subsPermissionFail.Count; Color=$(if ($subsPermissionFail.Count) { 'Red' } else { 'Gray' }) }
-$summaryRows += [pscustomobject]@{ Label='Subscriptions failed (other errors):'; Value=$subsOtherFail.Count; Color=$(if ($subsOtherFail.Count) { 'Red' } else { 'Gray' }) }
+$summaryRows += [ordered]@{ Label='Subscriptions with data:'; Value=$subsSuccessful.Count; Color='Green' }
+$summaryRows += [ordered]@{ Label='Subscriptions with no data:'; Value=$subsNoData.Count; Color=$(if ($subsNoData.Count) { 'Yellow' } else { 'Gray' }) }
+$summaryRows += [ordered]@{ Label='Failed - access denied (per-query):'; Value=$subsPermissionFail.Count; Color=$(if ($subsPermissionFail.Count) { 'Red' } else { 'Gray' }) }
+$summaryRows += [ordered]@{ Label='Subscriptions failed (other errors):'; Value=$subsOtherFail.Count; Color=$(if ($subsOtherFail.Count) { 'Red' } else { 'Gray' }) }
 if ($preflightSucceeded) {
-    $summaryRows += [pscustomobject]@{ Label='Skipped - MCSB not assigned:'; Value=$subsMcsbNotEnabled.Count; Color=$(if ($subsMcsbNotEnabled.Count) { 'Yellow' } else { 'Gray' }) }
-    $summaryRows += [pscustomobject]@{ Label='Skipped - Defender Foundational CSPM not enabled:'; Value=$subsNoSecurityVisibility.Count; Color=$(if ($subsNoSecurityVisibility.Count) { 'Yellow' } else { 'Gray' }) }
-    $summaryRows += [pscustomobject]@{ Label='Skipped - no access (pre-flight):'; Value=$subsNoSubscriptionAccess.Count; Color=$(if ($subsNoSubscriptionAccess.Count) { 'Red' } else { 'Gray' }) }
+    $summaryRows += [ordered]@{ Label='Skipped - MCSB not assigned:'; Value=$subsMcsbNotEnabled.Count; Color=$(if ($subsMcsbNotEnabled.Count) { 'Yellow' } else { 'Gray' }) }
+    $summaryRows += [ordered]@{ Label='Skipped - Defender Foundational CSPM not enabled:'; Value=$subsNoSecurityVisibility.Count; Color=$(if ($subsNoSecurityVisibility.Count) { 'Yellow' } else { 'Gray' }) }
+    $summaryRows += [ordered]@{ Label='Skipped - no access (pre-flight):'; Value=$subsNoSubscriptionAccess.Count; Color=$(if ($subsNoSubscriptionAccess.Count) { 'Red' } else { 'Gray' }) }
 }
 if ($riskPreflightSucceeded) {
-    $summaryRows += [pscustomobject]@{ Label='Defender CSPM not enabled (still queried):'; Value=$subsNoDefenderCspm.Count; Color=$(if ($subsNoDefenderCspm.Count) { 'Yellow' } else { 'Gray' }) }
+    $summaryRows += [ordered]@{ Label='Defender CSPM not enabled (still queried):'; Value=$subsNoDefenderCspm.Count; Color=$(if ($subsNoDefenderCspm.Count) { 'Yellow' } else { 'Gray' }) }
 }
 # Secure-score visibility: surface the X-of-Y rate explicitly so a 1-of-87 case
 # does not get presented as a tenant-wide average.
@@ -1864,16 +1908,16 @@ $ssColor = if ($ssReturnedCount -eq $SubscriptionCount -and $SubscriptionCount -
            elseif ($ssReturnedCount -gt 0) { 'Yellow' }
            else { 'Red' }
 if (-not $IsRiskBased) {
-    $summaryRows += [pscustomobject]@{ Label='Secure score returned:'; Value=("{0} of {1} subscriptions" -f $ssReturnedCount, $SubscriptionCount); Color=$ssColor }
+    $summaryRows += [ordered]@{ Label='Secure score returned:'; Value=("{0} of {1} subscriptions" -f $ssReturnedCount, $SubscriptionCount); Color=$ssColor }
 }
 if ($subsSecureScoreFailed.Count -gt 0) {
-    $summaryRows += [pscustomobject]@{ Label='Secure score query failed:'; Value=$subsSecureScoreFailed.Count; Color='Red' }
+    $summaryRows += [ordered]@{ Label='Secure score query failed:'; Value=$subsSecureScoreFailed.Count; Color='Red' }
 }
 if (Test-Path $FinalOutputFile) {
-    $summaryRows += [pscustomobject]@{ Label='Output file:'; Value=$FinalOutputFile; Color='White' }
-    $summaryRows += [pscustomobject]@{ Label='Output size:'; Value=(Get-FormattedFileSize -Bytes (Get-Item $FinalOutputFile).Length); Color='White' }
+    $summaryRows += [ordered]@{ Label='Output file:'; Value=$FinalOutputFile; Color='White' }
+    $summaryRows += [ordered]@{ Label='Output size:'; Value=(Get-FormattedFileSize -Bytes (Get-Item $FinalOutputFile).Length); Color='White' }
 }
-$summaryRows += [pscustomobject]@{ Label='Script execution time:'; Value=$durationFormatted; Color='White' }
+$summaryRows += [ordered]@{ Label='Script execution time:'; Value=$durationFormatted; Color='White' }
 Write-Host ""
 Write-Host $separator -ForegroundColor Cyan
 Write-Host " EXPORT SUMMARY" -ForegroundColor Cyan

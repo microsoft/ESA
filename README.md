@@ -39,6 +39,8 @@ Install-Module Az.Accounts, Az.ResourceGraph -Scope CurrentUser -Force
 
 > **Optional (parallel mode only):** If you enable `"Parallel": true` (see below), the script also needs the `ThreadJob` module. It will detect and offer to install it on first use - no manual setup required.
 
+**Language modes:** Constrained Language Mode (CLM) is supported for serial exports, including `-All`, on PowerShell 7 or later. **Only parallel execution requires FullLanguage Mode (FLM).** Keep `"Parallel": false` when using CLM.
+
 ## Usage
 
 To run the script, pass the path to a JSON parameter file:
@@ -70,7 +72,7 @@ Both exports are **optional and best-effort**: they are independent (if one is n
 
 **Retry Logic:** The script retries transient Azure Resource Graph failures automatically. General transient failures (`GatewayTimeout`, `InternalServerError`, `ServiceUnavailable`, network errors, TLS resets) use *exponential backoff* with up to 3 retries (delays of 4 / 8 / 16 seconds). Resource Graph throttling (`RateLimiting`, `TooManyRequests`) uses a more patient *linear* policy with up to 10 retries (delays of 5, 10, 15, … seconds) before a subscription is marked as failed. Status messages are shown during retries.
 
-**Parallel Execution (opt-in, EXPERIMENTAL):** By default the script processes subscriptions one at a time using the supported serial path (works on Windows PowerShell 5.1 and PowerShell 7+). To speed up large tenants, set `"Parallel": true` in the JSON parameter file - the script auto-sizes the worker pool based on the number of subscriptions. The parallel path is **experimental** and requires **PowerShell 7 or later** (Windows PowerShell 5.1 is not supported in this mode) plus the `ThreadJob` module (the script will offer to install it if missing). Each worker writes its own temporary CSV fragment; the script merges them into the final CSV in original subscription order after all workers finish. Per-subscription console output is **streamed live** as workers emit it, so lines from different subscriptions may interleave - each line carries the subscription ID so the output stays parseable. A `Write-Progress` bar shows live `done / in-flight` counts together with a per-worker label (e.g. `#2(page 8/14)`) so forward motion is visible across all in-flight workers.
+**Parallel Execution (opt-in, EXPERIMENTAL):** By default the script processes subscriptions one at a time using the supported serial path (works on Windows PowerShell 5.1 and PowerShell 7+; CLM requires PowerShell 7+). To speed up large tenants, set `"Parallel": true` in the JSON parameter file - the script auto-sizes the worker pool based on the number of subscriptions. The parallel path is **experimental** and requires **PowerShell 7 or later**, **FullLanguage Mode (FLM)** and the `ThreadJob` module (the script will offer to install it if missing). **Parallel execution is not supported in CLM.** Each worker writes its own temporary CSV fragment; the script merges them into the final CSV in original subscription order after all workers finish. Per-subscription console output is **streamed live** as workers emit it, so lines from different subscriptions may interleave - each line carries the subscription ID so the output stays parseable. A `Write-Progress` bar shows live `done / in-flight` counts together with a per-worker label (e.g. `#2(page 8/14)`) so forward motion is visible across all in-flight workers.
 
 **Error Logging:** If any errors occur during the execution of the KQL query, they will be logged in a file with the `.failed` extension.
 
